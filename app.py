@@ -28,6 +28,12 @@ try:
 except Exception:
     docx = None
 
+# ✅ 新增：更快的 PDF 文本抽取（可选）
+try:
+    import pypdf
+except Exception:
+    pypdf = None
+
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
@@ -44,6 +50,10 @@ STATE = {
 DICT_PATH = "data/ecdict.csv"
 if not os.path.exists(DICT_PATH):
     raise RuntimeError("缺少 data/ecdict.csv，请放到项目 data/ 目录下。")
+
+# ✅ 新增：抽取保险丝（可用环境变量覆盖）
+MAX_PAGES = int(os.getenv("MAX_PAGES", "300"))
+MAX_CHARS = int(os.getenv("MAX_CHARS", "800000"))
 
 _ec_dict = {}
 with open(DICT_PATH, "r", encoding="utf-8", newline="") as f:
@@ -76,9 +86,27 @@ _WORD_RE = re.compile(
 
 def _read_text_from_upload(fname: str, data: bytes) -> str:
     name = (fname or "").lower()
-    if name.endswith(".pdf") and pdf_extract_text is not None:
-        with io.BytesIO(data) as f:
-            return pdf_extract_text(f)
+    # ✅ 仅替换 PDF 分支：pypdf 优先，失败回退 pdfminer，并应用页数/字符上限
+    if name.endswith(".pdf"):
+        if pypdf is not None:
+            try:
+                reader = pypdf.PdfReader(io.BytesIO(data))
+                pages = min(len(reader.pages), MAX_PAGES)
+                chunks = []
+                for i in range(pages):
+                    t = reader.pages[i].extract_text() or ""
+                    chunks.append(t)
+                text = ("\n".join(chunks))[:MAX_CHARS]
+                if text.strip():
+                    return text
+            except Exception:
+                pass  # 回退 pdfminer
+
+        if pdf_extract_text is not None:
+            with io.BytesIO(data) as f:
+                t = pdf_extract_text(f) or ""
+                return t[:MAX_CHARS]
+
     if name.endswith(".docx") and docx is not None:
         with io.BytesIO(data) as bio:
             tmp = ".__tmp__.docx"
@@ -86,9 +114,9 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
                 w.write(bio.read())
             d = docx.Document(tmp)
             os.remove(tmp)
-        return "\n".join(p.text for p in d.paragraphs)
+        return ("\n".join(p.text for p in d.paragraphs))[:MAX_CHARS]
     try:
-        return data.decode("utf-8", errors="ignore")
+        return (data.decode("utf-8", errors="ignore"))[:MAX_CHARS]
     except Exception:
         return ""
 
