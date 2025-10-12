@@ -18,3 +18,5 @@ env/
 
 # Data cache (保留我们需要的词典，不要忽略 data/ecdict.csv)
 data/*.tmp
+
+data/ecd*.csv
