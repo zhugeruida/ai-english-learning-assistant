@@ -1,0 +1,39 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI英语学习助手</title>
+  <link rel="stylesheet" href="/static/style.css?v=4" />
+</head>
+<body>
+  <div class="container">
+    <h1 class="title">AI英语学习助手</h1>
+
+    <form class="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+      <div class="row">
+        <span class="label">选择文件（.pdf 或 .docx）</span>
+        <span class="sep">：</span>
+
+        <!-- 选择文件按钮（小一号） -->
+        <label for="file" class="btn btn-black btn-choose">选择文件</label>
+        <input id="file" name="file" type="file" accept=".pdf,.docx,.PDF,.DOCX" />
+
+        <!-- 文件名完整显示，不省略 -->
+        <span id="filename" class="filename"></span>
+
+        <button type="submit" class="btn btn-black btn-choose">上传并统计</button>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('file');
+    const nameSpan  = document.getElementById('filename');
+    fileInput.addEventListener('change', () => {
+      nameSpan.textContent = fileInput.files && fileInput.files[0] ? fileInput.files[0].name : '';
+    });
+  </script>
+</body>
+</html>

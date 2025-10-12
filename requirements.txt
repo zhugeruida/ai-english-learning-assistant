@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+pdfplumber
+python-docx
+pandas
+requests
+python-dotenv
+pdfminer.six
+xlsxwriter

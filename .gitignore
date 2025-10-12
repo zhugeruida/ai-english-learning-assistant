@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# venv
+.venv/
+env/
+
+# OS / IDE
+.DS_Store
+.vscode/
+
+# Local files
+.env
+*.xlsx
+
+# Data cache (保留我们需要的词典，不要忽略 data/ecdict.csv)
+data/*.tmp

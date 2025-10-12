@@ -1,0 +1,78 @@
+<!-- templates/result.html -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI英语学习助手 - 结果</title>
+  <link rel="stylesheet" href="/static/style.css?v=3" />
+</head>
+<body>
+  <div class="container">
+    <!-- 标题：与首页一致 -->
+    <h1 class="title">AI英语学习助手</h1>
+
+    <!-- 顶部文件信息 + 右侧操作按钮 -->
+    <div class="meta">
+      <div class="file">文件： <strong>{{ filename }}</strong></div>
+      <div class="right-actions">
+        <a href="/" class="btn btn-black">返回上传</a>
+        <a href="/export?sort={{ sort }}" class="btn btn-blue">导出表格</a>
+      </div>
+    </div>
+
+    <!-- 排序模式 -->
+    <div class="mode-row">
+      <a href="/result?sort=freq&page=1"
+         class="btn {% if sort=='freq' %}btn-dark{% else %}btn-gray{% endif %}">
+        词频降序排列
+      </a>
+      <a href="/result?sort=pos&page=1"
+         class="btn {% if sort=='pos' %}btn-dark{% else %}btn-gray{% endif %}">
+        出现位置排列
+      </a>
+    </div>
+
+    <!-- 小号分页（表格上方） -->
+    <div class="pager-compact">
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page=1">首页</a>
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page={{ page-1 if page>1 else 1 }}">上一页</a>
+      <div class="page-text">第 {{ page }} / {{ pages }} 页（共 {{ total }} 个不同单词，每页 {{ page_size }} 条）</div>
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page={{ page+1 if page<pages else pages }}">下一页</a>
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page={{ pages }}">尾页</a>
+    </div>
+
+    <!-- 表格 -->
+    <table class="words">
+      <thead>
+        <tr>
+          <th style="width:80px;">序号</th>
+          <th style="width:120px;">出现次数</th>
+          <th style="width:220px;">单词</th>
+          <th>翻译</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td class="center">{{ r['序号'] }}</td>
+          <td class="center">{{ r['出现次数'] }}次</td>
+          <td>{{ r['单词'] }}</td>
+          <td class="zh">{{ r['翻译'] | replace('\n','<br>') | safe }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <!-- 小号分页（表格下方，内容与上方一致） -->
+    <div class="pager-compact">
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page=1">首页</a>
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page={{ page-1 if page>1 else 1 }}">上一页</a>
+      <div class="page-text">第 {{ page }} / {{ pages }} 页（共 {{ total }} 个不同单词，每页 {{ page_size }} 条）</div>
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page={{ page+1 if page<pages else pages }}">下一页</a>
+      <a class="btn btn-black btn-sm" href="/result?sort={{ sort }}&page={{ pages }}">尾页</a>
+    </div>
+
+  </div>
+</body>
+</html>
