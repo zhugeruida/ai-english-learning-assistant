@@ -379,6 +379,12 @@ def export(sort: str = Query("freq", pattern="^(freq|pos)$")):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers
     )
+
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return {"status": "ok"}         # ← GET 保留返回 JSON
+
+@app.head("/healthz")
+def healthz_head():
+    # UptimeRobot 免费版用 HEAD 探测，返回 200 即可
+    return PlainTextResponse("", status_code=200)
