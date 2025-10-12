@@ -379,3 +379,6 @@ def export(sort: str = Query("freq", pattern="^(freq|pos)$")):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers
     )
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
