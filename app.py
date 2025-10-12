@@ -14,6 +14,7 @@ from collections import Counter
 import csv    # 轻量读取 ecdict.csv
 import time   # 日志查看哪一步耗时
 
+
 # ========= 新增：优先尝试 PyPDF =========
 try:
     from pypdf import PdfReader
@@ -85,51 +86,46 @@ _WORD_RE = re.compile(
 )
 
 def _read_text_from_upload(fname: str, data: bytes) -> str:
-    """按文件类型读取纯文本：
-       - PDF：优先 PyPDF + 页/字符保险丝；若无有效文本再回退 pdfminer
-       - DOCX：python-docx
-       - 其他：按 utf-8 解码
+    """
+    尽量快地把上传文件转成纯文本：
+    - PDF：优先 PyPDF（快），失败/少文本再回退到 pdfminer（稳），两者都受页数/字符上限保护
+    - DOCX：python-docx
+    - 其它：按 utf-8 尝试解码
     """
     name = (fname or "").lower()
 
-    # ---------- PDF 优先 PyPDF ----------
+    # ---------- PDF ----------
     if name.endswith(".pdf"):
-        # 1) 先尝试 PyPDF（通常比 pdfminer 快）
+        # 1) 先试 PyPDF（对“文本型 PDF”通常更快）
         if PdfReader is not None:
             try:
-                t0 = time.perf_counter()
                 reader = PdfReader(io.BytesIO(data))
-                text_chunks = []
-                char_count = 0
+                pieces, total = [], 0
                 pages = min(len(reader.pages), MAX_PAGES)
-
                 for i in range(pages):
-                    page = reader.pages[i]
-                    # PyPDF 的 extract_text() 很快；某些扫描件可能返回 None/""，我们照样拼
-                    chunk = page.extract_text() or ""
-                    if chunk:
-                        text_chunks.append(chunk)
-                        char_count += len(chunk)
-                        if char_count >= MAX_CHARS:
+                    txt = reader.pages[i].extract_text() or ""
+                    if txt:
+                        pieces.append(txt)
+                        total += len(txt)
+                        if total >= MAX_CHARS:
                             break
-
-                text_via_pypdf = "\n".join(text_chunks).strip()
-
-                # 如果拿到了“看起来像样”的文本（>50 个字符），直接用
+                text_via_pypdf = "\n".join(pieces).strip()
+                # 文本够多就直接用（已受 MAX_CHARS 保护）
                 if len(text_via_pypdf) > 50:
-                    return text_via_pypdf
-                # 否则（可能是扫描 PDF 或复杂排版），回退 pdfminer
-                # 这里不 return，继续往下走
-                # 但保留时间戳可在日志侧判断是否经常 fallback
-                # print(f"[DEBUG] PyPDF returned too few chars in {time.perf_counter()-t0:.3f}s, fallback to pdfminer")
+                    return text_via_pypdf[:MAX_CHARS]
+                # 否则（扫描版/结构奇怪）落到 pdfminer
             except Exception:
-                # PyPDF 解析报错，走回退
+                # PyPDF 解析失败，落到 pdfminer
                 pass
 
-        # 2) 回退：pdfminer（保底，较慢）
+        # 2) 回退：pdfminer（加页数/字符上限）
         if pdf_extract_text is not None:
-            with io.BytesIO(data) as f:
-                return pdf_extract_text(f)
+            try:
+                with io.BytesIO(data) as f:
+                    text = pdf_extract_text(f, maxpages=MAX_PAGES)  # 关键：限制页数
+                return (text or "")[:MAX_CHARS]
+            except Exception:
+                pass
         return ""
 
     # ---------- DOCX ----------
@@ -140,11 +136,11 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
                 w.write(bio.read())
             d = docx.Document(tmp)
             os.remove(tmp)
-        return "\n".join(p.text for p in d.paragraphs)
+        return "\n".join(p.text for p in d.paragraphs)[:MAX_CHARS]
 
     # ---------- 纯文本 ----------
     try:
-        return data.decode("utf-8", errors="ignore")
+        return data.decode("utf-8", errors="ignore")[:MAX_CHARS]
     except Exception:
         return ""
 
