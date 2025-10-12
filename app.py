@@ -147,6 +147,8 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
+
+    # 拆 possessive：you're -> you + 's
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -163,9 +165,25 @@ def _tokenize(text: str):
             toks.append("'s")
         else:
             toks.append(w)
-    # ✅ 仅保留 a / i / v / x，其他单字母丢弃（满足“移除孤立垃圾字母”且保留罗马数字）
+
+    # 关键修复：把被拆开的首字母 + 后续词头重新拼接（p + roject -> project）
+    stitched = []
+    i = 0
+    while i < len(toks):
+        w = toks[i]
+        if len(w) == 1 and w.isalpha() and i + 1 < len(toks):
+            nxt = toks[i + 1]
+            # 仅在下一段是字母开头且长度>=2时拼接；避免把 "'s"、数字等粘上
+            if len(nxt) >= 2 and nxt[0].isalpha():
+                stitched.append((w + nxt))
+                i += 2
+                continue
+        stitched.append(w)
+        i += 1
+
+    # 保留 a/i/v/x，清理剩余孤立单字母（减少噪声）
     allow_single = {"a", "i", "v", "x"}
-    toks = [w for w in toks if (len(w) > 1) or (w in allow_single)]
+    toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
     return toks
 
 # ---------- 显示与释义清洗 ----------
