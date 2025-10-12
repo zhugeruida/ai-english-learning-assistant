@@ -12,6 +12,7 @@ import unicodedata
 import pandas as pd
 from collections import Counter
 import csv    # 轻量读取 ecdict.csv
+import time #日志查看哪一步耗时
 
 # 可选：pdf/docx 解析
 try:
@@ -282,23 +283,47 @@ def index(request: Request):
 @app.post("/upload")
 async def upload(request: Request, file: UploadFile = File(...)):
     try:
+        t0 = time.perf_counter()
+        print(f"[TIMER] start upload {file.filename}")
+
+        # 阶段 1：读取文件
         data = await file.read()
+        t1 = time.perf_counter()
+        print(f"[TIMER] read bytes: {t1 - t0:.3f}s")
+
+        # 阶段 2：提取文本
         text = _read_text_from_upload(file.filename, data)
+        t2 = time.perf_counter()
+        print(f"[TIMER] extract text: {t2 - t1:.3f}s")
+
+        # 阶段 3：分词
         tokens = _tokenize(text)
+        t3 = time.perf_counter()
+        print(f"[TIMER] tokenize: {t3 - t2:.3f}s, tokens={len(tokens)}")
+
         if not tokens:
             raise ValueError("未解析到有效英文单词")
 
+        # 阶段 4：生成 DataFrame
         df_freq, df_pos = _build_dataframe(tokens)
+        t4 = time.perf_counter()
+        print(f"[TIMER] build dataframe: {t4 - t3:.3f}s")
+
+        # 阶段 5：保存状态 & 跳转
         STATE["filename"] = file.filename
         STATE["df_freq"] = df_freq
         STATE["df_pos"] = df_pos
+        print(f"[TIMER] total: {time.perf_counter() - t0:.3f}s")
+
         return RedirectResponse(url="/result?sort=freq&page=1", status_code=303)
+
     except Exception as e:
+        print(f"[ERROR] {e}")
         return PlainTextResponse(
             "处理文件时出现错误，请确认文件无损坏或换一份测试。\n\nDETAILS: " + str(e),
             status_code=500
         )
-
+    
 def _slice_page(df: pd.DataFrame, page: int, page_size: int):
     total = len(df)
     pages = max(1, (total + page_size - 1) // page_size)
