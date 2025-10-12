@@ -12,9 +12,15 @@ import unicodedata
 import pandas as pd
 from collections import Counter
 import csv    # 轻量读取 ecdict.csv
-import time #日志查看哪一步耗时
+import time   # 日志查看哪一步耗时
 
-# 可选：pdf/docx 解析
+# ========= 新增：优先尝试 PyPDF =========
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+# 可选：pdf/docx 解析（保留原有回退链路）
 try:
     from pdfminer_high_level import extract_text as pdf_extract_text  # 某些环境包名不同
 except Exception:
@@ -28,11 +34,9 @@ try:
 except Exception:
     docx = None
 
-# ✅ 新增：更快的 PDF 文本抽取（可选）
-try:
-    import pypdf
-except Exception:
-    pypdf = None
+# 保险丝（可用 Render Environment 覆盖）
+MAX_PAGES = int(os.getenv("MAX_PAGES", "500"))
+MAX_CHARS = int(os.getenv("MAX_CHARS", "1200000"))
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -50,10 +54,6 @@ STATE = {
 DICT_PATH = "data/ecdict.csv"
 if not os.path.exists(DICT_PATH):
     raise RuntimeError("缺少 data/ecdict.csv，请放到项目 data/ 目录下。")
-
-# ✅ 新增：抽取保险丝（可用环境变量覆盖）
-MAX_PAGES = int(os.getenv("MAX_PAGES", "300"))
-MAX_CHARS = int(os.getenv("MAX_CHARS", "800000"))
 
 _ec_dict = {}
 with open(DICT_PATH, "r", encoding="utf-8", newline="") as f:
@@ -85,28 +85,54 @@ _WORD_RE = re.compile(
 )
 
 def _read_text_from_upload(fname: str, data: bytes) -> str:
+    """按文件类型读取纯文本：
+       - PDF：优先 PyPDF + 页/字符保险丝；若无有效文本再回退 pdfminer
+       - DOCX：python-docx
+       - 其他：按 utf-8 解码
+    """
     name = (fname or "").lower()
-    # ✅ 仅替换 PDF 分支：pypdf 优先，失败回退 pdfminer，并应用页数/字符上限
-    if name.endswith(".pdf"):
-        if pypdf is not None:
-            try:
-                reader = pypdf.PdfReader(io.BytesIO(data))
-                pages = min(len(reader.pages), MAX_PAGES)
-                chunks = []
-                for i in range(pages):
-                    t = reader.pages[i].extract_text() or ""
-                    chunks.append(t)
-                text = ("\n".join(chunks))[:MAX_CHARS]
-                if text.strip():
-                    return text
-            except Exception:
-                pass  # 回退 pdfminer
 
+    # ---------- PDF 优先 PyPDF ----------
+    if name.endswith(".pdf"):
+        # 1) 先尝试 PyPDF（通常比 pdfminer 快）
+        if PdfReader is not None:
+            try:
+                t0 = time.perf_counter()
+                reader = PdfReader(io.BytesIO(data))
+                text_chunks = []
+                char_count = 0
+                pages = min(len(reader.pages), MAX_PAGES)
+
+                for i in range(pages):
+                    page = reader.pages[i]
+                    # PyPDF 的 extract_text() 很快；某些扫描件可能返回 None/""，我们照样拼
+                    chunk = page.extract_text() or ""
+                    if chunk:
+                        text_chunks.append(chunk)
+                        char_count += len(chunk)
+                        if char_count >= MAX_CHARS:
+                            break
+
+                text_via_pypdf = "\n".join(text_chunks).strip()
+
+                # 如果拿到了“看起来像样”的文本（>50 个字符），直接用
+                if len(text_via_pypdf) > 50:
+                    return text_via_pypdf
+                # 否则（可能是扫描 PDF 或复杂排版），回退 pdfminer
+                # 这里不 return，继续往下走
+                # 但保留时间戳可在日志侧判断是否经常 fallback
+                # print(f"[DEBUG] PyPDF returned too few chars in {time.perf_counter()-t0:.3f}s, fallback to pdfminer")
+            except Exception:
+                # PyPDF 解析报错，走回退
+                pass
+
+        # 2) 回退：pdfminer（保底，较慢）
         if pdf_extract_text is not None:
             with io.BytesIO(data) as f:
-                t = pdf_extract_text(f) or ""
-                return t[:MAX_CHARS]
+                return pdf_extract_text(f)
+        return ""
 
+    # ---------- DOCX ----------
     if name.endswith(".docx") and docx is not None:
         with io.BytesIO(data) as bio:
             tmp = ".__tmp__.docx"
@@ -114,9 +140,11 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
                 w.write(bio.read())
             d = docx.Document(tmp)
             os.remove(tmp)
-        return ("\n".join(p.text for p in d.paragraphs))[:MAX_CHARS]
+        return "\n".join(p.text for p in d.paragraphs)
+
+    # ---------- 纯文本 ----------
     try:
-        return (data.decode("utf-8", errors="ignore"))[:MAX_CHARS]
+        return data.decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
@@ -169,7 +197,6 @@ def _format_zh(zh: str) -> str:
         out.append(ln)
     return "\n".join(out)
 
-# 手动缩略词词典
 # 手动缩略词词典（直引号/弯引号都覆盖）
 MANUAL_CONTRACTIONS = {
     "don't": "aux. 表示否定（= do not）", "don’t": "aux. 表示否定（= do not）",
@@ -319,7 +346,7 @@ async def upload(request: Request, file: UploadFile = File(...)):
         t1 = time.perf_counter()
         print(f"[TIMER] read bytes: {t1 - t0:.3f}s")
 
-        # 阶段 2：提取文本
+        # 阶段 2：提取文本（已优化）
         text = _read_text_from_upload(file.filename, data)
         t2 = time.perf_counter()
         print(f"[TIMER] extract text: {t2 - t1:.3f}s")
@@ -351,7 +378,7 @@ async def upload(request: Request, file: UploadFile = File(...)):
             "处理文件时出现错误，请确认文件无损坏或换一份测试。\n\nDETAILS: " + str(e),
             status_code=500
         )
-    
+
 def _slice_page(df: pd.DataFrame, page: int, page_size: int):
     total = len(df)
     pages = max(1, (total + page_size - 1) // page_size)
