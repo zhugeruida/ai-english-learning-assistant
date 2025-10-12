@@ -148,7 +148,7 @@ def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
-    # 拆 possessive：you're -> you + 's
+    # possessive 拆分：you're -> you + 's
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -166,22 +166,22 @@ def _tokenize(text: str):
         else:
             toks.append(w)
 
-    # 关键修复：把被拆开的首字母 + 后续词头重新拼接（p + roject -> project）
+    # 仅对“非 a/i 的单字母 + 后续词头”进行拼接（修复 p roject 等断词）
     stitched = []
     i = 0
     while i < len(toks):
         w = toks[i]
-        if len(w) == 1 and w.isalpha() and i + 1 < len(toks):
+        if len(w) == 1 and w.isalpha() and w not in {"a", "i"} and i + 1 < len(toks):
             nxt = toks[i + 1]
-            # 仅在下一段是字母开头且长度>=2时拼接；避免把 "'s"、数字等粘上
+            # 仅当下一段是字母开头且长度>=2时拼接；避免把 's/数字 等粘上
             if len(nxt) >= 2 and nxt[0].isalpha():
-                stitched.append((w + nxt))
+                stitched.append(w + nxt)
                 i += 2
                 continue
         stitched.append(w)
         i += 1
 
-    # 保留 a/i/v/x，清理剩余孤立单字母（减少噪声）
+    # 结果清理：保留 a / i / v / x 这四个单字母，其余孤立单字母去噪
     allow_single = {"a", "i", "v", "x"}
     toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
     return toks
