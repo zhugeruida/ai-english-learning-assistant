@@ -148,7 +148,7 @@ def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
-    # possessive 拆分：you're -> you + 's
+    # 先按所有权拆分（you're -> you + 's; boys' -> boy + 's）
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -166,14 +166,15 @@ def _tokenize(text: str):
         else:
             toks.append(w)
 
-    # 仅对“非 a/i 的单字母 + 后续词头”进行拼接（修复 p roject 等断词）
+    # ✨ 修正：禁止把 a/i/v/x 这类“容易误黏连的单字母”与后词头拼接（避免 v + vi -> vvi）
+    # （仍保留对其它情况的首字母补全）
     stitched = []
     i = 0
+    NO_STITCH = {"a", "i", "v", "x"}   # 关键行
     while i < len(toks):
         w = toks[i]
-        if len(w) == 1 and w.isalpha() and w not in {"a", "i"} and i + 1 < len(toks):
+        if len(w) == 1 and w.isalpha() and w not in NO_STITCH and i + 1 < len(toks):
             nxt = toks[i + 1]
-            # 仅当下一段是字母开头且长度>=2时拼接；避免把 's/数字 等粘上
             if len(nxt) >= 2 and nxt[0].isalpha():
                 stitched.append(w + nxt)
                 i += 2
@@ -181,7 +182,7 @@ def _tokenize(text: str):
         stitched.append(w)
         i += 1
 
-    # 结果清理：保留 a / i / v / x 这四个单字母，其余孤立单字母去噪
+    # 仅保留 a / i / v / x 的单字母，其它孤立字母丢弃（降噪）
     allow_single = {"a", "i", "v", "x"}
     toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
     return toks
@@ -316,10 +317,10 @@ def _build_dataframe(tokens):
         "pos":   [first_pos[w] for w in ctr.keys()],
     })
 
-    # ① 用内存字典 _ec_dict 取释义
+    # ① 基础词典
     df["zh"] = df["word"].str.lower().map(_ec_dict).fillna("")
 
-    # ② 罗马数字兜底：译为“罗马数字N”
+    # ② 罗马数字（保持你原来的表驱动）
     is_roman = df["word"].map(lambda w: w in ROMAN_MAP)
     df.loc[is_roman, "zh"] = df.loc[is_roman, "word"].map(lambda w: f"罗马数字{ROMAN_MAP[w]}")
 
@@ -330,14 +331,42 @@ def _build_dataframe(tokens):
     mask_i = df["word"].eq("i")
     df.loc[mask_i, "zh"] = "pron. 我\nn. 碘元素；字母I；罗马数字1"
 
-    # ⑤ 复数兜底（ebooks -> 电子书（复数））
+    # ⑤ 连字符词：保持连字符，先整词查；不命中则分段查（丢掉单字母段）；仍无则“未收录”
+    def _hyphen_zh(word: str, cur: str) -> str:
+        if cur:  # 已有释义就不处理
+            return cur
+        if "-" in word:
+            parts = [p for p in word.split("-") if len(p) > 1]  # 忽略单字母段
+            seg_zh = []
+            for p in parts:
+                z = _ec_dict.get(p.lower(), "")
+                if not z and p.lower().endswith("s"):  # 分段里的复数兜底
+                    if p.lower().endswith("ies") and len(p) > 3:
+                        z = _ec_dict.get(p[:-3].lower() + "y", "")
+                    if not z and p.lower().endswith("es") and len(p) > 2:
+                        z = _ec_dict.get(p[:-2].lower(), "")
+                    if not z and p.lower().endswith("s") and len(p) > 1:
+                        z = _ec_dict.get(p[:-1].lower(), "")
+                if z:
+                    seg_zh.append(_format_zh(z))
+            if seg_zh:
+                return "-".join(seg_zh)  # 使用不换行连字符也可以，普通 '-' 也行
+            return "未收录"
+        return cur
+
+    df["zh"] = df.apply(lambda r: _hyphen_zh(r["word"], r["zh"]), axis=1)
+
+    # ⑥ 复数兜底（仍保留你原逻辑）
     need_plural = df["zh"].eq("") & df["word"].str.endswith("s")
     df.loc[need_plural, "zh"] = df.loc[need_plural, "word"].map(lambda w: _plural_fallback(w, _ec_dict))
 
-    # ⑥ 清洗/分行
+    # ⑦ 清洗/分行
     df["zh"] = df["zh"].map(_format_zh)
 
-    # ⑦ 显示层大小写
+    # ⑧ 仍为空 -> 最终兜底为“未收录”
+    df["zh"] = df["zh"].replace("", "未收录")
+
+    # ⑨ 显示层大小写
     df["word"] = df["word"].map(_display_casing)
 
     df_freq = df.sort_values(["count", "word"], ascending=[False, True]).reset_index(drop=True)
