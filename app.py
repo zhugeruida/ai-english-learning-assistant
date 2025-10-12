@@ -11,6 +11,7 @@ import re
 import unicodedata
 import pandas as pd
 from collections import Counter
+import csv    # 轻量读取 ecdict.csv
 
 # 可选：pdf/docx 解析
 try:
@@ -38,17 +39,33 @@ STATE = {
     "page_size": 500,
 }
 
-# 读取 ECDICT
+# 读取 ECDICT（轻量：只取需要列并存为 dict，降低内存占用）
 DICT_PATH = "data/ecdict.csv"
 if not os.path.exists(DICT_PATH):
     raise RuntimeError("缺少 data/ecdict.csv，请放到项目 data/ 目录下。")
 
-_ec = pd.read_csv(DICT_PATH, dtype=str, keep_default_na=False, low_memory=False)
-_ec = _ec[["word", "translation"]].rename(columns={"translation": "zh"})
-_ec["word"] = _ec["word"].str.lower()
+_ec_dict = {}
+with open(DICT_PATH, "r", encoding="utf-8", newline="") as f:
+    reader = csv.DictReader(f)
+    word_key = None
+    zh_key = None
+    for h in reader.fieldnames or []:
+        hl = h.strip().lower()
+        if hl == "word":
+            word_key = h
+        elif hl in ("translation", "zh", "trans"):
+            zh_key = h
+    if word_key is None or zh_key is None:
+        raise RuntimeError("ecdict.csv 缺少必须字段：word / translation")
 
-# possessive "'s" 统一翻译
-_ec = pd.concat([_ec, pd.DataFrame({"word": ["'s"], "zh": ["…的"]})], ignore_index=True)
+    for row in reader:
+        w = (row.get(word_key) or "").strip().lower()
+        zh = (row.get(zh_key) or "").strip()
+        if w:
+            _ec_dict[w] = zh
+
+# 给 possessive "'s" 固定翻译
+_ec_dict["'s"] = "…的"
 
 # ---------- 分词 ----------
 _WORD_RE = re.compile(
@@ -93,6 +110,9 @@ def _tokenize(text: str):
             toks.append("'s")
         else:
             toks.append(w)
+    # ✅ 仅保留 a / i / v / x，其他单字母丢弃（满足“移除孤立垃圾字母”且保留罗马数字）
+    allow_single = {"a", "i", "v", "x"}
+    toks = [w for w in toks if (len(w) > 1) or (w in allow_single)]
     return toks
 
 # ---------- 显示与释义清洗 ----------
@@ -121,6 +141,7 @@ def _format_zh(zh: str) -> str:
     return "\n".join(out)
 
 # 手动缩略词词典
+# 手动缩略词词典（直引号/弯引号都覆盖）
 MANUAL_CONTRACTIONS = {
     "don't": "aux. 表示否定（= do not）", "don’t": "aux. 表示否定（= do not）",
     "didn't": "aux. 不（= did not）", "didn’t": "aux. 不（= did not）",
@@ -134,28 +155,36 @@ MANUAL_CONTRACTIONS = {
     "couldn't": "不能（= could not）", "couldn’t": "不能（= could not）",
     "shouldn't": "不应该（= should not）", "shouldn’t": "不应该（= should not）",
     "doesn't": "aux. 表示否定（= does not）", "doesn’t": "aux. 表示否定（= does not）",
+
     "i'm": "abbr. 我是（= I am）", "i’m": "abbr. 我是（= I am）",
     "i've": "contr. 我已/我有（= I have）", "i’ve": "contr. 我已/我有（= I have）",
     "i'd": "contr. 我愿意/我已经/我应该（= I would / I had / I should）", "i’d": "contr. 我愿意/我已经/我应该（= I would / I had / I should）",
     "i'll": "contr. 我将/我会（= I will / I shall）", "i’ll": "contr. 我将/我会（= I will / I shall）",
+
     "you're": "contr. 你是（= you are）", "you’re": "contr. 你是（= you are）",
     "you've": "contr. 你已/你有（= you have）", "you’ve": "contr. 你已/你有（= you have）",
     "you'll": "contr. 你将/你会（= you will / you shall）", "you’ll": "contr. 你将/你会（= you will / you shall）",
+
     "we're": "contr. 我们是（= we are）", "we’re": "contr. 我们是（= we are）",
     "we've": "contr. 我们已/我们有（= we have）", "we’ve": "contr. 我们已/我们有（= we have）",
     "we'll": "contr. 我们将/我们会（= we will / we shall）", "we’ll": "contr. 我们将/我们会（= we will / we shall）",
+
     "they're": "contr. 他们是（= they are）", "they’re": "contr. 他们是（= they are）",
     "they've": "contr. 他们已/他们有（= they have）", "they’ve": "contr. 他们已/他们有（= they have）",
     "they'll": "contr. 他们将/他们会（= they will / they shall）", "they’ll": "contr. 他们将/他们会（= they will / they shall）",
+
     "he's": "contr. 他是/他有（= he is / he has）", "he’s": "contr. 他是/他有（= he is / he has）",
     "he'd": "contr. 他愿意/他已经/他应该（= he would / he had / he should）", "he’d": "contr. 他愿意/他已经/他应该（= he would / he had / he should）",
     "he'll": "contr. 他将/他会（= he will / he shall）", "he’ll": "contr. 他将/他会（= he will / he shall）",
+
     "she's": "contr. 她是/她有（= she is / she has）", "she’s": "contr. 她是/她有（= she is / she has）",
     "she'd": "contr. 她愿意/她已经/她应该（= she would / she had / she should）", "she’d": "contr. 她愿意/她已经/她应该（= she would / she had / she should）",
     "she'll": "contr. 她将/她会（= she will / she shall）", "she’ll": "contr. 她将/她会（= she will / she shall）",
+
     "it's": "contr. 它是/它有（= it is / it has）", "it’s": "contr. 它是/它有（= it is / it has）",
     "it'll": "contr. 它将/它会（= it will）", "it’ll": "contr. 它将/它会（= it will）",
     "it'd": "contr. 它将会/它本会（= it would / it had）", "it’d": "contr. 它将会/它本会（= it would / it had）",
+
     "that's": "那是；正是（= that is / that has）", "that’s": "那是；正是（= that is / that has）",
     "there's": "那里有；有（= there is / there has）", "there’s": "那里有；有（= there is / there has）",
     "here's": "这儿是；给你（= here is）", "here’s": "这儿是；给你（= here is）",
@@ -163,6 +192,7 @@ MANUAL_CONTRACTIONS = {
     "who's": "谁是（= who is / who has）", "who’s": "谁是（= who is / who has）",
     "where's": "哪里是；哪里有（= where is / where has）", "where’s": "哪里是；哪里有（= where is / where has）",
     "how's": "情况如何（= how is / how has）", "how’s": "情况如何（= how is / how has）",
+
     "let's": "让我们…（= let us）", "let’s": "让我们…（= let us）",
     "o'clock": "abbr. ……点钟（of the clock）", "o’clock": "abbr. ……点钟（of the clock）",
 }
@@ -216,29 +246,28 @@ def _build_dataframe(tokens):
         "pos":   [first_pos[w] for w in ctr.keys()],
     })
 
-    df = df.merge(_ec, on="word", how="left")
-    df["zh"] = df["zh"].fillna("")
+    # ① 用内存字典 _ec_dict 取释义
+    df["zh"] = df["word"].str.lower().map(_ec_dict).fillna("")
 
-    # 罗马数字兜底：译为“罗马数字N”
+    # ② 罗马数字兜底：译为“罗马数字N”
     is_roman = df["word"].map(lambda w: w in ROMAN_MAP)
     df.loc[is_roman, "zh"] = df.loc[is_roman, "word"].map(lambda w: f"罗马数字{ROMAN_MAP[w]}")
 
-    # 缩略词兜底
+    # ③ 缩略词兜底
     df["zh"] = df.apply(lambda r: MANUAL_CONTRACTIONS.get(r["word"], r["zh"]), axis=1).astype(str)
 
-    # special: i / I 多义显示（覆盖最终释义，再交给 _format_zh 分行）
+    # ④ special: i / I 多义显示——分行
     mask_i = df["word"].eq("i")
-    df.loc[mask_i, "zh"] = "pron. 我; n. 碘元素；字母I；罗马数字1"
+    df.loc[mask_i, "zh"] = "pron. 我\nn. 碘元素；字母I；罗马数字1"
 
-    # 复数兜底（ebooks -> 电子书（复数））
-    base_zh_lookup = {row["word"]: row["zh"] for _, row in _ec.iterrows()}
+    # ⑤ 复数兜底（ebooks -> 电子书（复数））
     need_plural = df["zh"].eq("") & df["word"].str.endswith("s")
-    df.loc[need_plural, "zh"] = df.loc[need_plural, "word"].map(lambda w: _plural_fallback(w, base_zh_lookup))
+    df.loc[need_plural, "zh"] = df.loc[need_plural, "word"].map(lambda w: _plural_fallback(w, _ec_dict))
 
-    # 清洗/分行
+    # ⑥ 清洗/分行
     df["zh"] = df["zh"].map(_format_zh)
 
-    # 显示层大小写
+    # ⑦ 显示层大小写
     df["word"] = df["word"].map(_display_casing)
 
     df_freq = df.sort_values(["count", "word"], ascending=[False, True]).reset_index(drop=True)
