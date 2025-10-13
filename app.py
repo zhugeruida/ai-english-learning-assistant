@@ -166,25 +166,37 @@ def _tokenize(text: str):
         else:
             toks.append(w)
 
-    # ✨ 修正：禁止把 a/i/v/x 这类“容易误黏连的单字母”与后词头拼接（避免 v + vi -> vvi）
-    # （仍保留对其它情况的首字母补全）
+    # =========== 修复 A：只在“单字母 + 后词”组成的拼接结果是词典已收录时，才进行首字母补全 ===========
+    # 这样就不会把 "f"+"limited" 拼成 "flimited"，或 "s"+"hart" 拼成 "shart"
     stitched = []
     i = 0
-    NO_STITCH = {"a", "i", "v", "x"}   # 关键行
     while i < len(toks):
         w = toks[i]
-        if len(w) == 1 and w.isalpha() and w not in NO_STITCH and i + 1 < len(toks):
+        if len(w) == 1 and w.isalpha() and i + 1 < len(toks):
             nxt = toks[i + 1]
             if len(nxt) >= 2 and nxt[0].isalpha():
-                stitched.append(w + nxt)
-                i += 2
-                continue
+                cand = (w + nxt)  # 例如 "p" + "aralysed" -> "paralysed"
+                if cand in _ec_dict:          # 只有在词典里时才拼接
+                    stitched.append(cand)
+                    i += 2
+                    continue
         stitched.append(w)
         i += 1
 
+    # =========== 修复 B：“人名 + ’ll” -> 仅保留人名（如 Daisy’ll -> Daisy） ===========
+    # 依赖 ALWAYS_CAP 中的人名（已含 "daisy"）
+    fixed = []
+    for w in stitched:
+        if (w.endswith("’ll") or w.endswith("'ll")) and len(w) > 3:
+            base = w[:-3]
+            if base in ALWAYS_CAP:   # 仅在人名场景剥离 ’ll；其它 we'll 等保持不变
+                fixed.append(base)
+                continue
+        fixed.append(w)
+
     # 仅保留 a / i / v / x 的单字母，其它孤立字母丢弃（降噪）
     allow_single = {"a", "i", "v", "x"}
-    toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
+    toks = [w for w in fixed if (len(w) > 1) or (w in allow_single)]
     return toks
 
 # ---------- 显示与释义清洗 ----------
@@ -277,15 +289,54 @@ ROMAN_MAP = {
     "xi":11,"xii":12,"xiii":13,"xiv":14,"xv":15,"xvi":16,"xvii":17,"xviii":18,"xix":19,"xx":20
 }
 
+# —— 自动专有名词识别（基于正文）——
+DETECTED_PROPER = set()  # 动态收集：本篇文档里识别出的专有名词（小写存）
+
+# 句首常见大写词黑名单（避免把 "The, When, And ..." 识别成专有名词）
+_TITLECASE_STOP = {
+    "the","a","an","and","but","or","nor","for","so","yet",
+    "when","where","what","who","whom","whose","why","which","while",
+    "if","in","on","at","to","of","from","with","without","into","onto","over","under","about","above","below",
+    "he","she","it","they","we","you","i","his","her","its","their","our","your",
+    "this","that","these","those","there","here","then","thus","hence","once",
+}
+
+# 不把月份/星期二次纳入专有名词集（你已有专门规则）
+_MONTHS_DAYS = set(list(MONTHS) + list(WEEKDAYS))
+
+_PROPER_RE = re.compile(
+    r"(?<![\.!\?:]\s)(?<!^)\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\b"  # 非句点/问号/感叹号/冒号 + 空格之后的位置，再匹配 TitleCase 或连字符TitleCase
+)
+
+def _detect_proper_nouns_from_text(raw_text: str):
+    """
+    仅扫描一遍原始文本，抽取可能的专有名词（TitleCase，且不是典型句首词）。
+    保存为全局小写集合：DETECTED_PROPER
+    """
+    DETECTED_PROPER.clear()
+    for m in _PROPER_RE.finditer(raw_text):
+        w = m.group(1)
+        wl = w.lower()
+        if wl in _TITLECASE_STOP or wl in _MONTHS_DAYS or wl == "i":
+            continue
+        DETECTED_PROPER.add(wl)
+
 def _display_casing(word: str) -> str:
+    # 1) 特例优先
     if word == "i":
         return "I"
-    if word.startswith("i'") or word.startswith("i’"):
-        return "I" + word[1:]
-    if word in MONTHS or word in WEEKDAYS or word in ALWAYS_CAP:
-        return word[:1].upper() + word[1:]
     if word in ROMAN_MAP:
         return word.upper()
+
+    # 2) 来自文本的自动专有名词 或 人工 ALWAYS_CAP
+    if word in DETECTED_PROPER or word in ALWAYS_CAP:
+        return word[:1].upper() + word[1:]
+
+    # 3) 月份/星期也维持首字母
+    if word in MONTHS or word in WEEKDAYS:
+        return word[:1].upper() + word[1:]
+
+    # 4) 默认原样（小写）
     return word
 
 def _plural_fallback(word: str, base_zh_lookup) -> str:
@@ -391,6 +442,7 @@ async def upload(request: Request, file: UploadFile = File(...)):
 
         # 阶段 2：提取文本（已优化）
         text = _read_text_from_upload(file.filename, data)
+        _detect_proper_nouns_from_text(text)  # ← 新增：本篇文档的专有名词检测
         t2 = time.perf_counter()
         print(f"[TIMER] extract text: {t2 - t1:.3f}s")
 
