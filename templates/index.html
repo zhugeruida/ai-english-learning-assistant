@@ -28,12 +28,31 @@
     </form>
   </div>
 
+  <!-- === 加载覆盖层（新增） === -->
+  <div id="page-loader" aria-hidden="true">
+    <div class="loader-box">
+      <div class="loader-bar"><span class="loader-progress"></span></div>
+      <div class="loader-text">正在处理，请稍候…</div>
+    </div>
+  </div>
+
   <script>
     const fileInput = document.getElementById('file');
     const nameSpan  = document.getElementById('filename');
     fileInput.addEventListener('change', () => {
       nameSpan.textContent = fileInput.files && fileInput.files[0] ? fileInput.files[0].name : '';
     });
+
+    // 提交表单时显示加载层（新增）
+    (function () {
+      const form = document.querySelector('form.upload-form');
+      const loader = document.getElementById('page-loader');
+      if (form && loader) {
+        form.addEventListener('submit', function () {
+          loader.classList.add('show');
+        });
+      }
+    })();
   </script>
 </body>
 </html>
