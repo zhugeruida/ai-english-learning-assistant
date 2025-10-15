@@ -205,7 +205,19 @@ def _tokenize(text: str):
             toks.append("'s")
         else:
             toks.append(w)
+        # ……上一段：构造完 toks 之后
+    # 额外处理：人名 + ’ll / 'll  => 仅保留人名（不影响 we'll/you'll 等）
+    fixed = []
+    for w in toks:
+        if (w.endswith("’ll") or w.endswith("'ll")) and len(w) > 3:
+            base = w[:-3]
+            if base in ALWAYS_CAP:   # 仅对人名生效
+                fixed.append(base)
+                continue
+        fixed.append(w)
+    toks = fixed
 
+  
     # 你之前的“单字母+后词”首字母补全的防误拼策略保持不变（略）
     stitched = []
     i = 0
