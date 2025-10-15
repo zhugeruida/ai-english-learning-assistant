@@ -170,10 +170,13 @@ def _preclean_text(text: str) -> str:
 
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
-    text = _preclean_text(text)  # ← 新增：预清洗（修补黏连 + 忽略网址/邮箱）
+
+    # ① 先粗暴去掉 URL（含 www. 与 http/https）
+    text = re.sub(r"(https?://\S+|www\.\S+)", " ", text)
+
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
-    # 先按所有权拆分（you're -> you + 's; boys' -> boy + 's）
+    # ② possessive 拆分（你原来的逻辑保留）
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -191,37 +194,36 @@ def _tokenize(text: str):
         else:
             toks.append(w)
 
-    # =========== 修复 A：只在“单字母 + 后词”组成的拼接结果是词典已收录时，才进行首字母补全 ===========
-    # 这样就不会把 "f"+"limited" 拼成 "flimited"，或 "s"+"hart" 拼成 "shart"
+    # ③ “前缀+后词”智能拼接：
+    #    - 允许 1~2 个字母的前缀（处理 a+ttention、in+dicate 等）
+    #    - 只在合并后单词存在于词典（_ec_dict）时才拼
     stitched = []
     i = 0
     while i < len(toks):
-        w = toks[i]
-        if len(w) == 1 and w.isalpha() and i + 1 < len(toks):
+        cur = toks[i]
+        if i + 1 < len(toks) and cur.isalpha() and 1 <= len(cur) <= 2:
             nxt = toks[i + 1]
-            if len(nxt) >= 2 and nxt[0].isalpha():
-                cand = (w + nxt)  # 例如 "p" + "aralysed" -> "paralysed"
-                if cand in _ec_dict:          # 只有在词典里时才拼接
+            if nxt.isalpha() and len(nxt) >= 2:
+                cand = cur + nxt
+                if cand in _ec_dict and _ec_dict[cand]:
                     stitched.append(cand)
                     i += 2
                     continue
-        stitched.append(w)
+        # 保留你之前的“1 字母首字母补全（仅在字典里才补）”兼容性
+        if i + 1 < len(toks) and cur.isalpha() and len(cur) == 1:
+            nxt = toks[i + 1]
+            if nxt.isalpha() and len(nxt) >= 2:
+                cand = cur + nxt
+                if cand in _ec_dict and _ec_dict[cand]:
+                    stitched.append(cand)
+                    i += 2
+                    continue
+        stitched.append(cur)
         i += 1
 
-    # =========== 修复 B：“人名 + ’ll” -> 仅保留人名（如 Daisy’ll -> Daisy） ===========
-    # 依赖 ALWAYS_CAP 中的人名（已含 "daisy"）
-    fixed = []
-    for w in stitched:
-        if (w.endswith("’ll") or w.endswith("'ll")) and len(w) > 3:
-            base = w[:-3]
-            if base in ALWAYS_CAP:   # 仅在人名场景剥离 ’ll；其它 we'll 等保持不变
-                fixed.append(base)
-                continue
-        fixed.append(w)
-
-    # 仅保留 a / i / v / x 的单字母，其它孤立字母丢弃（降噪）
+    # ④ 仅保留 a / i / v / x 的单字母，其它孤立字母丢弃（降噪）
     allow_single = {"a", "i", "v", "x"}
-    toks = [w for w in fixed if (len(w) > 1) or (w in allow_single)]
+    toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
     return toks
 
 # ---------- 显示与释义清洗 ----------
