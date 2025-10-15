@@ -144,8 +144,33 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
     except Exception:
         return ""
 
+# ========== 预清洗：修补常见“黏连词”，剔除 URL/邮箱 ==========
+_URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)[^\s]+")
+_EMAIL_RE = re.compile(r"(?i)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+# 前后容易被粘连的高频“功能词”——仅覆盖常见、不会误切的那些
+_SUFFIX_FUNCS = r"(?:from|for|the|that|this|these|those|your|our|their|and|to|of|with|without)"
+_PREFIX_FUNCS = r"(?:and|or|but|for|to|of|in|on|at|from|by|the|that|this|these|those|with|without)"
+
+def _preclean_text(text: str) -> str:
+    # 1) 干掉 URL / 邮箱
+    text = _URL_RE.sub(" ", text)
+    text = _EMAIL_RE.sub(" ", text)
+
+    # 2) 修补“前字母 + 功能词”被黏连的情形：...Xfrom / ...Xyour / ...Xthe
+    # 例如 takenfrom -> taken from, markyour -> mark your
+    text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
+
+    # 3) 修补“功能词 + 后单词”被黏连的情形：witha -> with a, andit -> and it
+    text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z])", r"\1 \2", text, flags=re.IGNORECASE)
+
+    # 4) 收缩多空格
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
+    text = _preclean_text(text)  # ← 新增：预清洗（修补黏连 + 忽略网址/邮箱）
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
     # 先按所有权拆分（you're -> you + 's; boys' -> boy + 's）
@@ -304,22 +329,60 @@ _TITLECASE_STOP = {
 # 不把月份/星期二次纳入专有名词集（你已有专门规则）
 _MONTHS_DAYS = set(list(MONTHS) + list(WEEKDAYS))
 
-_PROPER_RE = re.compile(
-    r"(?<![\.!\?:]\s)(?<!^)\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\b"  # 非句点/问号/感叹号/冒号 + 空格之后的位置，再匹配 TitleCase 或连字符TitleCase
-)
+# —— 自动专有名词识别（基于正文）——
+DETECTED_PROPER = set()  # 动态收集：本篇文档里识别出的专有名词（小写存）
+
+# 句首常见大写词黑名单（避免把 "The, When, And ..." 识别成专有名词）
+_TITLECASE_STOP = {
+    "the","a","an","and","but","or","nor","for","so","yet",
+    "when","where","what","who","whom","whose","why","which","while",
+    "if","in","on","at","to","of","from","with","without","into","onto","over","under","about","above","below",
+    "he","she","it","they","we","you","i","his","her","its","their","our","your",
+    "this","that","these","those","there","here","then","thus","hence","once",
+}
+
+# 数词 / 代词 / 常见功能词：不作为专有名词（解决 Two / My / Men / Part 等误判）
+_COMMON_LOWER_STOP = {
+    # 数词 & 序数
+    "one","two","three","four","five","six","seven","eight","nine","ten",
+    "first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth",
+    # 常见名词/动词在试卷标题、题干里经常 TitleCase
+    "part","section","passage","dialogue","answer","sheet","points","choice","choices",
+    "men","women","time","more","from","about","my","our","your",
+}
+
+_MONTHS_DAYS = set(list(MONTHS) + list(WEEKDAYS))
+
+# TitleCase 候选（含连字符），但先不过滤句首，只做统计
+_PROPER_RE = re.compile(r"\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\b")
+
+# 统一的小写词扫描
+_WORD_LOWER_RE = re.compile(r"\b([a-z]+(?:-[a-z]+)?)\b")
 
 def _detect_proper_nouns_from_text(raw_text: str):
     """
-    仅扫描一遍原始文本，抽取可能的专有名词（TitleCase，且不是典型句首词）。
-    保存为全局小写集合：DETECTED_PROPER
+    仅扫描一遍原始文本，统计 TitleCase 与 lower 的次数：
+    - 只有当某个词（小写形态）在全文 TitleCase 次数 >= 2 且 lower 次数 == 0 时，
+      才视为“很可能是专有名词”（并且不在各类 stop 表里，且不是月份/星期）。
+    这样可以避免把 Part / My / Two / Men 等泛词纳入专有名词集合。
     """
     DETECTED_PROPER.clear()
+    cap_cnt = Counter()
+    low_cnt = Counter()
+
     for m in _PROPER_RE.finditer(raw_text):
-        w = m.group(1)
-        wl = w.lower()
-        if wl in _TITLECASE_STOP or wl in _MONTHS_DAYS or wl == "i":
-            continue
-        DETECTED_PROPER.add(wl)
+        wl = m.group(1).lower()
+        cap_cnt[wl] += 1
+
+    for m in _WORD_LOWER_RE.finditer(raw_text):
+        wl = m.group(1).lower()
+        low_cnt[wl] += 1
+
+    for wl, c in cap_cnt.items():
+        if c >= 2 and low_cnt.get(wl, 0) == 0:
+            if wl in _TITLECASE_STOP or wl in _COMMON_LOWER_STOP or wl in _MONTHS_DAYS or wl == "i":
+                continue
+            DETECTED_PROPER.add(wl)
 
 def _display_casing(word: str) -> str:
     # 1) 特例优先
