@@ -243,6 +243,59 @@ def _tokenize(text: str):
         stitched.append(w1)
         i += 1
 
+    # === 新增：功能词“边缘救援”（只保留功能词 + 尝试邻接合并）===
+    SMALL_FWS = {
+        'to','the','from','your','our','their','his','her','my','and','or','of','in','on','for'
+    }
+    rescued = []
+    i = 0
+    while i < len(stitched):
+        t = stitched[i].lower()
+        n = len(stitched)
+
+        handled = False
+
+        # 1) 前缀功能词：or+phr -> 'or' + ('phr'并尝试与下一 token 合并成 phrase)
+        for fw in SMALL_FWS:
+            if t.startswith(fw) and 1 <= len(t) - len(fw) <= 3:
+                tail = t[len(fw):]
+                # 试着与下一 token 合并（如 'phr' + 'ase' -> 'phrase'）
+                if i + 1 < n and (tail + stitched[i+1].lower()) in _ec_dict:
+                    rescued.append(fw)
+                    rescued.append(tail + stitched[i+1].lower())
+                    i += 2
+                else:
+                    rescued.append(fw)  # 丢弃短尾残片
+                    i += 1
+                handled = True
+                break
+        if handled:
+            continue
+
+        # 2) 后缀功能词：g+from / vered+to / tle+to 等
+        for fw in SMALL_FWS:
+            if t.endswith(fw) and 1 <= len(t) - len(fw) <= 4:
+                pre = t[:-len(fw)]
+                # 与上一 token 合并（如 'con' + 'verted'）
+                if rescued and (rescued[-1] + pre) in _ec_dict:
+                    rescued[-1] = (rescued[-1] + pre)
+                # 或与下一 token 合并（如 'rec' + 'ord'）
+                elif i + 1 < n and (pre + stitched[i+1].lower()) in _ec_dict:
+                    rescued.append(pre + stitched[i+1].lower())
+                    i += 1
+                # pre 本身不是词，直接丢弃
+                rescued.append(fw)
+                i += 1
+                handled = True
+                break
+        if handled:
+            continue
+
+        rescued.append(t)
+        i += 1
+
+    stitched = rescued  # 用救援后的序列进入后续流程
+
     # 二次修复：功能词裂开 + 贪心切分
     _FUNC_WORDS = {
         'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
@@ -312,7 +365,9 @@ def _tokenize(text: str):
     allow_single = {"a", "i", "v", "x"}
     ALLOW_2 = {'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'}
     NOISE_2 = {'ou','kf','rw','th','ei'}
-    NOISE_3 = {'mor','ses'}
+    # 新增：典型 OCR 残片（极小黑名单）
+    NOISE_3 = {'mor','ses','phr'}
+    NOISE_4 = {'toge'}
 
     def _is_consonant_only(s: str) -> bool:
         return re.fullmatch(r"[bcdfghjklmnpqrstvwxyz]+", s) is not None
@@ -338,6 +393,9 @@ def _tokenize(text: str):
                     continue
             filtered.append(w)
             continue
+        if len(w) == 4:
+            if w in NOISE_4:
+                continue
         # 4–5 字母：非词典且非功能词，且“全辅音或元音计数<=1 或字符种类<=2” → 视为噪声
         if 4 <= len(w) <= 5 and (w not in _ec_dict) and (w not in _FUNC_WORDS):
             vowels = len(re.findall(r"[aeiou]", w))
@@ -449,7 +507,6 @@ _TITLECASE_STOP = {
     "he","she","it","they","we","you","i","his","her","its","their","our","your",
     "this","that","these","those","there","here","then","thus","hence","once",
     "directions","dialogue","text","paper","okay","oh","uh",
-    # 新增栏目/题干词
     "phrases","answers","choices","passage","section","part"
 }
 
