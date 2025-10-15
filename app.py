@@ -171,23 +171,16 @@ def _preclean_text(text: str) -> str:
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # === 新增（最小增量）①：合字标准化 + 下划线/题号清理 ===
+    # === 【新增-最小增量 1】合字标准化 + 下划线/题号清理 ===
     text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
 
-    # —— 预清洗：只做你要的三件事 ——
-    # ① 忽略 URL（含 http(s) 与 www.）
+    # —— 预清洗（保留）：忽略 URL；拆驼峰 ===
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
-
-    # ② 拆驼峰/选项字母：如 “MakedA,B,C” → “Maked A , B , C”
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
 
-    # ③ 拆常见“夹心词”（PDF 丢空格）：the/that/your/our/their/his/her/my 等
-    _CONNECTORS = ('the','that','your','our','their','his','her','my',
-                   'answer','answers','phrases','demand')
-    for w in _CONNECTORS:
-        pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
-        text = pat.sub(r'\1 \2 \3', text)
+    # === 【删除-最小增量】取消“夹心词硬拆循环”以避免 together/another 等被误切 ===
+    # （原来这里遍历 _CONNECTORS 在词内强插空格，已移除）
 
     # （以下与你原来一致）
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
@@ -235,7 +228,7 @@ def _tokenize(text: str):
         stitched.append(w)
         i += 1
 
-    # === 新增（最小增量）②：仅对“未命中词典”的 token 做二次拆分/兜底 ===
+    # === 【新增-最小增量 2】对“未命中词典”的 token 做保守救援切分 + 词典贪心切分 ===
     _FUNC_WORDS = {
         'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
         'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about',
@@ -254,7 +247,6 @@ def _tokenize(text: str):
         while changed:
             changed = False
             for fw in _FUNC_WORDS:
-                # 仅在 fw 两侧都是字母时拆分，避免命中整个词等误切
                 pat = re.compile(rf'([a-z]+)({fw})([a-z]+)', re.IGNORECASE)
                 new_s, n = pat.subn(r'\1 \2 \3', s)
                 if n > 0:
@@ -265,16 +257,11 @@ def _tokenize(text: str):
     from functools import lru_cache
     @lru_cache(maxsize=2048)
     def _greedy_dict_cut(s: str):
-        """
-        基于词典的贪心最大匹配，仅用于未知且较长的 token。
-        返回 list[str] 或 None（失败）。
-        """
         sl = s.lower()
         if sl in _ec_dict or sl in _FUNC_WORDS:
             return [sl]
         if len(sl) < 6:
             return None
-        # 前缀从长到短尝试
         for i in range(min(len(sl), 20), 1, -1):
             left = sl[:i]
             if (left in _ec_dict) or (left in _FUNC_WORDS):
@@ -292,11 +279,9 @@ def _tokenize(text: str):
         if wl in _ec_dict or wl in {"'s"} or len(wl) <= 1:
             repaired.append(wl)
             continue
-        # 先按功能词做黏连拆分
         s = _split_by_func_words(wl)
         parts = s.split()
         if len(parts) > 1:
-            # 逐段再看是否需要贪心切分
             tmp = []
             for p in parts:
                 if (p in _ec_dict) or (p in _FUNC_WORDS) or (len(p) <= 1):
@@ -309,15 +294,23 @@ def _tokenize(text: str):
                         tmp.append(p)
             repaired.extend(tmp)
             continue
-        # 单段未知且较长 -> 贪心切分
         cut = _greedy_dict_cut(wl)
         if cut:
             repaired.extend(cut)
         else:
             repaired.append(wl)
 
+    # === 【新增-最小增量 3】二字母噪声过滤（保留少数白名单 + 词典命中）
+    TWO_LETTER_KEEP = {
+        'to','of','or','in','on','by','at','as','is','we','he','be','do','so','no','go','up','us','if','me','my','an','am'
+    }
     allow_single = {"a", "i", "v", "x"}
-    toks = [w for w in repaired if (len(w) > 1) or (w in allow_single)]
+    toks = [
+        w for w in repaired
+        if (len(w) > 2)
+        or (len(w) == 1 and w in allow_single)
+        or (len(w) == 2 and (w in TWO_LETTER_KEEP or w in _ec_dict))
+    ]
     return toks
 
 # ---------- 显示与释义清洗 ----------
