@@ -110,8 +110,10 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
                         if total >= MAX_CHARS:
                             break
                 text_via_pypdf = "\n".join(pieces).strip()
+                # 文本够多就直接用（已受 MAX_CHARS 保护）
                 if len(text_via_pypdf) > 50:
                     return text_via_pypdf[:MAX_CHARS]
+                # 否则（扫描版/结构奇怪）落到 pdfminer
             except Exception:
                 pass
 
@@ -145,6 +147,7 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
 _URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)[^\s]+")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 
+# 前后容易被粘连的高频“功能词”
 _SUFFIX_FUNCS = r"(?:from|for|the|that|this|these|those|your|our|their|and|to|of|with|without)"
 _PREFIX_FUNCS = r"(?:and|or|but|for|to|of|in|on|at|from|by|the|that|this|these|those|with|without)"
 
@@ -159,28 +162,25 @@ def _preclean_text(text: str) -> str:
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # === 合字标准化 + 杂质清理（最小增量） ===
-    text = (text
-            .replace("ﬁ", "fi").replace("ﬂ", "fl")
-            .replace("ﬃ", "ffi").replace("ﬄ", "ffl")
-            .replace("ﬀ", "ff").replace("ﬅ", "ft").replace("ﬆ", "st"))
+    # —— 合字/下划线清理（最小增量）——
+    text = (text.replace("ﬁ", "fi")
+                .replace("ﬂ", "fl")
+                .replace("ﬃ", "ffi")
+                .replace("ﬄ", "ffl"))
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
 
-    # —— 预清洗：只做你要的三件事 ——
-    text = re.sub(r'https?://\S+|www\.\S+', ' ', text)              # ① 忽略 URL
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)                # ② 拆驼峰/选项字母
-
-    # ③ 常见“夹心词” （保持你原来的关键词）
+    # —— 预清洗：忽略 URL、拆驼峰、修“夹心词” —— 
+    text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
     _CONNECTORS = ('the','that','your','our','their','his','her','my',
                    'answer','answers','phrases','demand')
     for w in _CONNECTORS:
         pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
         text = pat.sub(r'\1 \2 \3', text)
 
-    # === 正式分词 ===
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
-    # 所有格拆分
+    # —— 所有格拆分 —— 
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -198,7 +198,7 @@ def _tokenize(text: str):
         else:
             toks.append(w)
 
-    # 人名 + 'll 特例（不影响 we'll/you'll）
+    # —— 人名 + 'll：仅保留人名 —— 
     fixed = []
     for w in toks:
         if (w.endswith("’ll") or w.endswith("'ll")) and len(w) > 3:
@@ -209,11 +209,20 @@ def _tokenize(text: str):
         fixed.append(w)
     toks = fixed
 
-    # 你原来的“单字母+后词”保守拼接（仅词典命中才拼）
+    # —— 黏连修复（扩展）：若 w + next 命中词典，则合并 —— 
     stitched = []
     i = 0
     while i < len(toks):
         w = toks[i]
+        if i + 1 < len(toks):
+            nxt = toks[i + 1]
+            cand = (w + nxt)
+            # 控制拼接长度，避免过度合并
+            if 2 <= len(w) <= 10 and 1 <= len(nxt) <= 10 and cand in _ec_dict:
+                stitched.append(cand)
+                i += 2
+                continue
+        # 保留你原来的“单字母 + 后词”拼接兜底（已被上面的更泛化逻辑覆盖，但仍保留安全网）
         if len(w) == 1 and w.isalpha() and i + 1 < len(toks):
             nxt = toks[i + 1]
             if len(nxt) >= 2 and nxt[0].isalpha():
@@ -225,7 +234,7 @@ def _tokenize(text: str):
         stitched.append(w)
         i += 1
 
-    # === 二次修复（仅对未知 token 做） ===
+    # —— 仅对“未知 token”做二次修复：按功能词裂开 + 词典贪心切分 —— 
     _FUNC_WORDS = {
         'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
         'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about',
@@ -239,50 +248,24 @@ def _tokenize(text: str):
     }
 
     def _split_by_func_words(s: str) -> str:
-        """
-        在未知 token 内按功能词插空格：覆盖
-        1) 中间: [a-z]+ fw [a-z]+
-        2) 前缀: fw [a-z]+
-        3) 后缀: [a-z]+ fw
-        多轮直到不再变化。
-        """
         changed = True
         while changed:
             changed = False
             for fw in _FUNC_WORDS:
-                # 中间
-                pat_mid = re.compile(rf'([a-z]+)({fw})([a-z]+)', re.IGNORECASE)
-                s2, n2 = pat_mid.subn(r'\1 \2 \3', s)
-                if n2 > 0:
-                    s = s2
-                    changed = True
-                    continue
-                # 前缀（如 withfour / orphrase / toincrease）
-                pat_pre = re.compile(rf'^({fw})([a-z]+)$', re.IGNORECASE)
-                s3, n3 = pat_pre.subn(r'\1 \2', s)
-                if n3 > 0:
-                    s = s3
-                    changed = True
-                    continue
-                # 后缀（如 gfrom / isfythe / t leto / vertedto）
-                pat_suf = re.compile(rf'^([a-z]+)({fw})$', re.IGNORECASE)
-                s4, n4 = pat_suf.subn(r'\1 \2', s)
-                if n4 > 0:
-                    s = s4
+                pat = re.compile(rf'([a-z]+)({fw})([a-z]+)', re.IGNORECASE)
+                new_s, n = pat.subn(r'\1 \2 \3', s)
+                if n > 0:
+                    s = new_s
                     changed = True
         return s
 
     from functools import lru_cache
-
     @lru_cache(maxsize=2048)
     def _greedy_dict_cut(s: str):
-        """
-        基于词典的贪心最大匹配，仅用于未知且较长的 token。
-        """
         sl = s.lower()
         if sl in _ec_dict or sl in _FUNC_WORDS:
             return [sl]
-        if len(sl) < 5:
+        if len(sl) < 6:
             return None
         for i in range(min(len(sl), 20), 1, -1):
             left = sl[:i]
@@ -301,7 +284,6 @@ def _tokenize(text: str):
         if wl in _ec_dict or wl in {"'s"} or len(wl) <= 1:
             repaired.append(wl)
             continue
-        # 先按功能词做黏连拆分（覆盖中间/前缀/后缀）
         s = _split_by_func_words(wl)
         parts = s.split()
         if len(parts) > 1:
@@ -311,40 +293,35 @@ def _tokenize(text: str):
                     tmp.append(p)
                 else:
                     cut = _greedy_dict_cut(p)
-                    if cut:
-                        tmp.extend(cut)
-                    else:
-                        tmp.append(p)
+                    tmp.extend(cut if cut else [p])
             repaired.extend(tmp)
             continue
-        # 单段未知且较长 -> 贪心切分
         cut = _greedy_dict_cut(wl)
-        if cut:
-            repaired.extend(cut)
-        else:
-            repaired.append(wl)
+        repaired.extend(cut if cut else [wl])
 
-    # === 温和降噪：只在最终阶段做，避免干扰正常词 ===
+    # —— 噪声过滤：丢弃“短且非词典”的碎片 —— 
     allow_single = {"a", "i", "v", "x"}
-    out = []
+    ALLOW_2 = {
+        'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'
+    }
+
+    filtered = []
     for w in repaired:
+        # 保留 1 字母的白名单（a/i/v/x）
         if len(w) == 1:
             if w in allow_single:
-                out.append(w)
-            # 其它单字母丢弃（清掉 g/e 这类幽灵尾巴）
+                filtered.append(w)
             continue
-        if len(w) == 2:
-            # 两字母：不在词典且不在功能词表 -> 视为噪声（干掉 se 等）
-            if (w not in _ec_dict) and (w not in _FUNC_WORDS):
+        # 2 字母：非词典、非功能词、非白名单 => 丢弃（如 kf、rw、th、ei）
+        if len(w) == 2 and (w not in _ec_dict) and (w not in ALLOW_2) and (w not in _FUNC_WORDS):
+            continue
+        # 3 字母：非词典 / 非功能词 且 不含元音 => 纯辅音碎片，丢弃（如 rwt）
+        if len(w) == 3 and (w not in _ec_dict) and (w not in _FUNC_WORDS):
+            if not re.search(r'[aeiou]', w):
                 continue
-        if 3 <= len(w) <= 4:
-            # 3~4 长度的纯辅音残片且不在词典/功能词 -> 丢弃，如 'phr','tlt'
-            if re.fullmatch(r'[^aeiou]+', w) and (w not in _ec_dict) and (w not in _FUNC_WORDS):
-                continue
-        out.append(w)
+        filtered.append(w)
 
-    toks = out
-    return toks
+    return filtered
 
 # ---------- 显示与释义清洗 ----------
 _POS_TAGS = ["n", "vi", "vt", "v", "adj", "a", "adv", "art", "pron", "prep",
@@ -371,6 +348,7 @@ def _format_zh(zh: str) -> str:
         out.append(ln)
     return "\n".join(out)
 
+# 手动缩略词词典
 MANUAL_CONTRACTIONS = {
     "don't": "aux. 表示否定（= do not）", "don’t": "aux. 表示否定（= do not）",
     "didn't": "aux. 不（= did not）", "didn’t": "aux. 不（= did not）",
@@ -438,14 +416,18 @@ ROMAN_MAP = {
 # —— 自动专有名词识别（基于正文）——
 DETECTED_PROPER = set()
 
+# 句首常见大写词黑名单（扩充：避免 Directions / Dialogue / Text / Paper / Oh / Uh / Okay 误判）
 _TITLECASE_STOP = {
     "the","a","an","and","but","or","nor","for","so","yet",
     "when","where","what","who","whom","whose","why","which","while",
     "if","in","on","at","to","of","from","with","without","into","onto","over","under","about","above","below",
     "he","she","it","they","we","you","i","his","her","its","their","our","your",
     "this","that","these","those","there","here","then","thus","hence","once",
+    # 新增栏目/感叹词
+    "directions","dialogue","text","paper","okay","oh","uh"
 }
 
+# 数词 / 代词 / 常见功能词
 _COMMON_LOWER_STOP = {
     "one","two","three","four","five","six","seven","eight","nine","ten",
     "first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth",
@@ -716,8 +698,9 @@ def export(sort: str = Query("freq", pattern="^(freq|pos)$")):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return {"status": "ok"}         # ← GET 保留返回 JSON
 
 @app.head("/healthz")
 def healthz_head():
+    # UptimeRobot 免费版用 HEAD 探测，返回 200 即可
     return PlainTextResponse("", status_code=200)
