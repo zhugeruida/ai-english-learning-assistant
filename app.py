@@ -171,12 +171,24 @@ def _preclean_text(text: str) -> str:
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # ① 先粗暴去掉 URL（含 www. 与 http/https）
-    text = re.sub(r"(https?://\S+|www\.\S+)", " ", text)
+    # —— 预清洗：只做你要的三件事 ——
+    # ① 忽略 URL（含 http(s) 与 www.）
+    text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
 
+    # ② 拆驼峰/选项字母：如 “MakedA,B,C” → “Maked A , B , C”
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+
+    # ③ 拆常见“夹心词”（PDF 丢空格）：the/that/your/our/their/his/her/my 等
+    _CONNECTORS = ('the','that','your','our','their','his','her','my',
+                   'answer','answers','phrases','demand')
+    for w in _CONNECTORS:
+        # …x the y… / …xthe y… / …x they… 均拆开
+        pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
+        text = pat.sub(r'\1 \2 \3', text)
+
+    # （以下与你原来一致）
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
-
-    # ② possessive 拆分（你原来的逻辑保留）
+    # 先按所有权拆分（you're -> you + 's; boys' -> boy + 's）
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -194,34 +206,22 @@ def _tokenize(text: str):
         else:
             toks.append(w)
 
-    # ③ “前缀+后词”智能拼接：
-    #    - 允许 1~2 个字母的前缀（处理 a+ttention、in+dicate 等）
-    #    - 只在合并后单词存在于词典（_ec_dict）时才拼
+    # 你之前的“单字母+后词”首字母补全的防误拼策略保持不变（略）
     stitched = []
     i = 0
     while i < len(toks):
-        cur = toks[i]
-        if i + 1 < len(toks) and cur.isalpha() and 1 <= len(cur) <= 2:
+        w = toks[i]
+        if len(w) == 1 and w.isalpha() and i + 1 < len(toks):
             nxt = toks[i + 1]
-            if nxt.isalpha() and len(nxt) >= 2:
-                cand = cur + nxt
-                if cand in _ec_dict and _ec_dict[cand]:
+            if len(nxt) >= 2 and nxt[0].isalpha():
+                cand = (w + nxt)
+                if cand in _ec_dict:  # 只有词典命中才拼
                     stitched.append(cand)
                     i += 2
                     continue
-        # 保留你之前的“1 字母首字母补全（仅在字典里才补）”兼容性
-        if i + 1 < len(toks) and cur.isalpha() and len(cur) == 1:
-            nxt = toks[i + 1]
-            if nxt.isalpha() and len(nxt) >= 2:
-                cand = cur + nxt
-                if cand in _ec_dict and _ec_dict[cand]:
-                    stitched.append(cand)
-                    i += 2
-                    continue
-        stitched.append(cur)
+        stitched.append(w)
         i += 1
 
-    # ④ 仅保留 a / i / v / x 的单字母，其它孤立字母丢弃（降噪）
     allow_single = {"a", "i", "v", "x"}
     toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
     return toks
@@ -443,6 +443,19 @@ def _build_dataframe(tokens):
     # ③ 缩略词兜底
     df["zh"] = df.apply(lambda r: MANUAL_CONTRACTIONS.get(r["word"], r["zh"]), axis=1).astype(str)
 
+    # ③.1 数字+d 的专业缩略：2d / 3d / 其他 nd
+    #    —— 只补“尚无释义”的词，不影响已命中的词典/缩略/罗马数字逻辑
+    # 特别按你的话术
+    mask_3d = df["word"].str.lower().eq("3d")
+    mask_2d = df["word"].str.lower().eq("2d")
+    df.loc[mask_3d & df["zh"].eq(""), "zh"] = "abbr. 三维的（three dimensional）；三维（three dimensions）"
+    df.loc[mask_2d & df["zh"].eq(""), "zh"] = "abbr. 2维（2 dimensional）"
+    # 其它 nd 的通用兜底
+    mask_nd = df["word"].str.match(r"^\d+d$", na=False)
+    df.loc[mask_nd & df["zh"].eq(""), "zh"] = df.loc[mask_nd & df["zh"].eq(""), "word"].map(
+        lambda w: f"abbr. {w[:-1]}维（{w[:-1]} dimensional）"
+    )
+
     # ④ special: i / I 多义显示——分行
     mask_i = df["word"].eq("i")
     df.loc[mask_i, "zh"] = "pron. 我\nn. 碘元素；字母I；罗马数字1"
@@ -466,7 +479,7 @@ def _build_dataframe(tokens):
                 if z:
                     seg_zh.append(_format_zh(z))
             if seg_zh:
-                return "-".join(seg_zh)  # 使用不换行连字符也可以，普通 '-' 也行
+                return "-".join(seg_zh)
             return "未收录"
         return cur
 
@@ -482,7 +495,7 @@ def _build_dataframe(tokens):
     # ⑧ 仍为空 -> 最终兜底为“未收录”
     df["zh"] = df["zh"].replace("", "未收录")
 
-    # ⑨ 显示层大小写
+    # ⑨ 显示层大小写（含你的专有名词自动识别/人名表）
     df["word"] = df["word"].map(_display_casing)
 
     df_freq = df.sort_values(["count", "word"], ascending=[False, True]).reset_index(drop=True)
