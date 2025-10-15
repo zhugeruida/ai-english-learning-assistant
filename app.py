@@ -162,12 +162,19 @@ def _preclean_text(text: str) -> str:
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # —— 合字/下划线清理（最小增量）——
+    # === ① 行尾断词还原（de-hyphenation，仅这一步是新增）===
+    #  atmo-\n spheric  -> atmospheric
+    text = re.sub(r"([A-Za-z])-\s*\n\s*([A-Za-z])", r"\1\2\n", text)
+
+    # —— 合字/下划线清理（原有 + 保持不动）——
     text = (text.replace("ﬁ", "fi")
                 .replace("ﬂ", "fl")
                 .replace("ﬃ", "ffi")
                 .replace("ﬄ", "ffl"))
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
+
+    # === ② 斜杠连写拆分（仅新增；只在字母两侧时断开）===
+    text = re.sub(r"(?<=\w)[\\/](?=\w)", " ", text)
 
     # —— 预清洗：忽略 URL、拆驼峰、修“夹心词” —— 
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
@@ -222,7 +229,7 @@ def _tokenize(text: str):
                 stitched.append(cand)
                 i += 2
                 continue
-        # 保留你原来的“单字母 + 后词”拼接兜底（已被上面的更泛化逻辑覆盖，但仍保留安全网）
+        # 保留你原来的“单字母 + 后词”拼接兜底
         if len(w) == 1 and w.isalpha() and i + 1 < len(toks):
             nxt = toks[i + 1]
             if len(nxt) >= 2 and nxt[0].isalpha():
@@ -251,9 +258,9 @@ def _tokenize(text: str):
         changed = True
         while changed:
             changed = False
-            for fw in _FUNC_WORDS:
-                # ←← 唯一改动：两侧至少 2 个字母，避免把 more/your 等正常词切断
-                pat = re.compile(rf'([a-z]{{2,}})({fw})([a-z]{{2,}})', re.IGNORECASE)
+            # ← 已加保护：两侧≥2字母，避免把 more/your 之类健康词切断
+            pat_list = [re.compile(rf'([a-z]{{2,}})({fw})([a-z]{{2,}})', re.IGNORECASE) for fw in _FUNC_WORDS]
+            for pat in pat_list:
                 new_s, n = pat.subn(r'\1 \2 \3', s)
                 if n > 0:
                     s = new_s
@@ -305,6 +312,9 @@ def _tokenize(text: str):
     ALLOW_2 = {
         'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'
     }
+    # === ③ 非常小的黑名单：你点名的残片 ===
+    NOISE_2 = {'ou','kf','rw','th','ei'}
+    NOISE_3 = {'mor','ses'}
 
     filtered = []
     for w in repaired:
@@ -313,13 +323,23 @@ def _tokenize(text: str):
             if w in allow_single:
                 filtered.append(w)
             continue
-        # 2 字母：非词典、非功能词、非白名单 => 丢弃（如 kf、rw、th、ei）
-        if len(w) == 2 and (w not in _ec_dict) and (w not in ALLOW_2) and (w not in _FUNC_WORDS):
-            continue
-        # 3 字母：非词典 / 非功能词 且 不含元音 => 纯辅音碎片，丢弃（如 rwt）
-        if len(w) == 3 and (w not in _ec_dict) and (w not in _FUNC_WORDS):
-            if not re.search(r'[aeiou]', w):
+        # 2 字母：命中黑名单 => 丢弃；否则按原规则
+        if len(w) == 2:
+            if w in NOISE_2:
                 continue
+            if (w not in _ec_dict) and (w not in ALLOW_2) and (w not in _FUNC_WORDS):
+                continue
+            filtered.append(w)
+            continue
+        # 3 字母：命中黑名单 => 丢弃；否则按原规则
+        if len(w) == 3:
+            if w in NOISE_3:
+                continue
+            if (w not in _ec_dict) and (w not in _FUNC_WORDS):
+                if not re.search(r'[aeiou]', w):
+                    continue
+            filtered.append(w)
+            continue
         filtered.append(w)
 
     return filtered
