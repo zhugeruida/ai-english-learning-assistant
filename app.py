@@ -157,47 +157,23 @@ def _preclean_text(text: str) -> str:
     text = _URL_RE.sub(" ", text)
     text = _EMAIL_RE.sub(" ", text)
 
-    # 2) 修补“前单词 + 功能词”被黏连：takenfrom -> taken from, markyour -> mark your
-    text = re.sub(rf"\b([A-Za-z]+)({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
+    # 2) 修补“前字母 + 功能词”被黏连的情形：...Xfrom / ...Xyour / ...Xthe
+    # 例如 takenfrom -> taken from, markyour -> mark your
+    text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
 
-    # 3) 修补“功能词 + 后单词”被黏连：withfour -> with four, andit -> and it
-    text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z]+)\b", r"\1 \2", text, flags=re.IGNORECASE)
-
-    # 3.1 be动词后面被粘：areconvertedto -> are convertedto
-    text = re.sub(r"\b(are|is|was|were|be|been|being)([A-Za-z]+)\b", r"\1 \2", text, flags=re.IGNORECASE)
-
-    # 3.2 末尾 to 被粘：convertedto -> converted to
-    text = re.sub(r"\b([A-Za-z]+)(to)\b", r"\1 \2", text, flags=re.IGNORECASE)
+    # 3) 修补“功能词 + 后单词”被黏连的情形：witha -> with a, andit -> and it
+    text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z])", r"\1 \2", text, flags=re.IGNORECASE)
 
     # 4) 收缩多空格
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
-# —— 疑似截断词修复（针对 researc->research, atmosp->atmosphere 等，仅在词典命中时替换）——
-_TRUNC_TAILS = [
-    "e","r","d","s","h",
-    "er","ed","es","ly","al",
-    "ion","ment","ing","ive","ous","ity",
-    "her","here","phere","arch","ph","ch","re",
-    "ther"
-]
-def _try_repair_tail(w: str) -> str:
-    if len(w) < 4 or w in _ec_dict:
-        return w
-    wl = w.lower()
-    if wl in _ec_dict:
-        return wl
-    for suf in _TRUNC_TAILS:
-        cand = wl + suf
-        if cand in _ec_dict:
-            return cand
-    return w
-
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # 先做一遍预清洗（拆 withfour/markyour/areconvertedto 等）
-    text = _preclean_text(text)
+    # === 新增（最小增量）①：合字标准化 + 下划线/题号清理 ===
+    text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
+    text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
 
     # —— 预清洗：只做你要的三件事 ——
     # ① 忽略 URL（含 http(s) 与 www.）
@@ -210,7 +186,6 @@ def _tokenize(text: str):
     _CONNECTORS = ('the','that','your','our','their','his','her','my',
                    'answer','answers','phrases','demand')
     for w in _CONNECTORS:
-        # …x the y… / …xthe y… / …x they… 均拆开
         pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
         text = pat.sub(r'\1 \2 \3', text)
 
@@ -233,18 +208,18 @@ def _tokenize(text: str):
             toks.append("'s")
         else:
             toks.append(w)
-    # 额外处理：人名 + ’ll / 'll  => 仅保留人名（不影响 we'll/you'll 等）
+    # 人名 + ’ll / 'll  => 仅保留人名（不影响 we'll/you'll 等）
     fixed = []
     for w in toks:
         if (w.endswith("’ll") or w.endswith("'ll")) and len(w) > 3:
             base = w[:-3]
-            if base in ALWAYS_CAP:   # 仅对人名生效
+            if base in ALWAYS_CAP:
                 fixed.append(base)
                 continue
         fixed.append(w)
     toks = fixed
 
-    # 你之前的“单字母+后词”首字母补全的防误拼策略保持不变（略）
+    # 你之前的“单字母+后词”首字母补全的防误拼策略保持不变
     stitched = []
     i = 0
     while i < len(toks):
@@ -253,18 +228,96 @@ def _tokenize(text: str):
             nxt = toks[i + 1]
             if len(nxt) >= 2 and nxt[0].isalpha():
                 cand = (w + nxt)
-                if cand in _ec_dict:  # 只有词典命中才拼
+                if cand in _ec_dict:
                     stitched.append(cand)
                     i += 2
                     continue
         stitched.append(w)
         i += 1
 
-    # stitched 构造完之后 —— 对“未命中词典且像是少尾巴”的做一次轻量修复
-    stitched = [_try_repair_tail(w) for w in stitched]
+    # === 新增（最小增量）②：仅对“未命中词典”的 token 做二次拆分/兜底 ===
+    _FUNC_WORDS = {
+        'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
+        'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about',
+        'above','below','because','before','after','between','within','during','until','since','against',
+        'among','per','via','are','is','be','been','being','was','were','not','no','do','does','did',
+        'will','would','can','could','should','may','might','must','if','then','so','such','other',
+        'another','each','every','some','any','more','most','many','much','few','several','both','either',
+        'neither','own','same','too','very','just','even','also','less','least','again','further','up',
+        'down','out','off','here','there','where','when','why','how','one','two','three','four','five',
+        'six','seven','eight','nine','ten'
+    }
+
+    def _split_by_func_words(s: str) -> str:
+        """在一个未知 token 内按功能词插空格（多轮），如 areconvertedto -> are converted to / withfour -> with four"""
+        changed = True
+        while changed:
+            changed = False
+            for fw in _FUNC_WORDS:
+                # 仅在 fw 两侧都是字母时拆分，避免命中整个词等误切
+                pat = re.compile(rf'([a-z]+)({fw})([a-z]+)', re.IGNORECASE)
+                new_s, n = pat.subn(r'\1 \2 \3', s)
+                if n > 0:
+                    s = new_s
+                    changed = True
+        return s
+
+    from functools import lru_cache
+    @lru_cache(maxsize=2048)
+    def _greedy_dict_cut(s: str):
+        """
+        基于词典的贪心最大匹配，仅用于未知且较长的 token。
+        返回 list[str] 或 None（失败）。
+        """
+        sl = s.lower()
+        if sl in _ec_dict or sl in _FUNC_WORDS:
+            return [sl]
+        if len(sl) < 6:
+            return None
+        # 前缀从长到短尝试
+        for i in range(min(len(sl), 20), 1, -1):
+            left = sl[:i]
+            if (left in _ec_dict) or (left in _FUNC_WORDS):
+                rest = sl[i:]
+                if not rest:
+                    return [left]
+                cut_rest = _greedy_dict_cut(rest)
+                if cut_rest:
+                    return [left] + cut_rest
+        return None
+
+    repaired = []
+    for w in stitched:
+        wl = w.lower()
+        if wl in _ec_dict or wl in {"'s"} or len(wl) <= 1:
+            repaired.append(wl)
+            continue
+        # 先按功能词做黏连拆分
+        s = _split_by_func_words(wl)
+        parts = s.split()
+        if len(parts) > 1:
+            # 逐段再看是否需要贪心切分
+            tmp = []
+            for p in parts:
+                if (p in _ec_dict) or (p in _FUNC_WORDS) or (len(p) <= 1):
+                    tmp.append(p)
+                else:
+                    cut = _greedy_dict_cut(p)
+                    if cut:
+                        tmp.extend(cut)
+                    else:
+                        tmp.append(p)
+            repaired.extend(tmp)
+            continue
+        # 单段未知且较长 -> 贪心切分
+        cut = _greedy_dict_cut(wl)
+        if cut:
+            repaired.extend(cut)
+        else:
+            repaired.append(wl)
 
     allow_single = {"a", "i", "v", "x"}
-    toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
+    toks = [w for w in repaired if (len(w) > 1) or (w in allow_single)]
     return toks
 
 # ---------- 显示与释义清洗 ----------
@@ -372,10 +425,8 @@ _TITLECASE_STOP = {
 
 # 数词 / 代词 / 常见功能词：不作为专有名词（解决 Two / My / Men / Part 等误判）
 _COMMON_LOWER_STOP = {
-    # 数词 & 序数
     "one","two","three","four","five","six","seven","eight","nine","ten",
     "first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth",
-    # 常见名词/动词在试卷标题、题干里经常 TitleCase
     "part","section","passage","dialogue","answer","sheet","points","choice","choices",
     "men","women","time","more","from","about","my","our","your",
 }
@@ -393,7 +444,6 @@ def _detect_proper_nouns_from_text(raw_text: str):
     仅扫描一遍原始文本，统计 TitleCase 与 lower 的次数：
     - 只有当某个词（小写形态）在全文 TitleCase 次数 >= 2 且 lower 次数 == 0 时，
       才视为“很可能是专有名词”（并且不在各类 stop 表里，且不是月份/星期）。
-    这样可以避免把 Part / My / Two / Men 等泛词纳入专有名词集合。
     """
     DETECTED_PROPER.clear()
     cap_cnt = Counter()
@@ -414,21 +464,14 @@ def _detect_proper_nouns_from_text(raw_text: str):
             DETECTED_PROPER.add(wl)
 
 def _display_casing(word: str) -> str:
-    # 1) 特例优先
     if word == "i":
         return "I"
     if word in ROMAN_MAP:
         return word.upper()
-
-    # 2) 来自文本的自动专有名词 或 人工 ALWAYS_CAP
     if word in DETECTED_PROPER or word in ALWAYS_CAP:
         return word[:1].upper() + word[1:]
-
-    # 3) 月份/星期也维持首字母
     if word in MONTHS or word in WEEKDAYS:
         return word[:1].upper() + word[1:]
-
-    # 4) 默认原样（小写）
     return word
 
 def _plural_fallback(word: str, base_zh_lookup) -> str:
@@ -463,14 +506,14 @@ def _build_dataframe(tokens):
     # ① 基础词典
     df["zh"] = df["word"].str.lower().map(_ec_dict).fillna("")
 
-    # ② 罗马数字（保持你原来的表驱动）
+    # ② 罗马数字
     is_roman = df["word"].map(lambda w: w in ROMAN_MAP)
     df.loc[is_roman, "zh"] = df.loc[is_roman, "word"].map(lambda w: f"罗马数字{ROMAN_MAP[w]}")
 
     # ③ 缩略词兜底
     df["zh"] = df.apply(lambda r: MANUAL_CONTRACTIONS.get(r["word"], r["zh"]), axis=1).astype(str)
 
-    # ③.1 数字+d 的专业缩略：2d / 3d / 其他 nd
+    # ③.1 数字+d 的专业缩略
     mask_3d = df["word"].str.lower().eq("3d")
     mask_2d = df["word"].str.lower().eq("2d")
     df.loc[mask_3d & df["zh"].eq(""), "zh"] = "abbr. 三维的（three dimensional）；三维（three dimensions）"
@@ -480,20 +523,20 @@ def _build_dataframe(tokens):
         lambda w: f"abbr. {w[:-1]}维（{w[:-1]} dimensional）"
     )
 
-    # ④ special: i / I 多义显示——分行
+    # ④ special: i / I
     mask_i = df["word"].eq("i")
     df.loc[mask_i, "zh"] = "pron. 我\nn. 碘元素；字母I；罗马数字1"
 
-    # ⑤ 连字符词：保持连字符，先整词查；不命中则分段查（丢掉单字母段）；仍无则“未收录”
+    # ⑤ 连字符词兜底
     def _hyphen_zh(word: str, cur: str) -> str:
-        if cur:  # 已有释义就不处理
+        if cur:
             return cur
         if "-" in word:
-            parts = [p for p in word.split("-") if len(p) > 1]  # 忽略单字母段
+            parts = [p for p in word.split("-") if len(p) > 1]
             seg_zh = []
             for p in parts:
                 z = _ec_dict.get(p.lower(), "")
-                if not z and p.lower().endswith("s"):  # 分段里的复数兜底
+                if not z and p.lower().endswith("s"):
                     if p.lower().endswith("ies") and len(p) > 3:
                         z = _ec_dict.get(p[:-3].lower() + "y", "")
                     if not z and p.lower().endswith("es") and len(p) > 2:
@@ -509,17 +552,17 @@ def _build_dataframe(tokens):
 
     df["zh"] = df.apply(lambda r: _hyphen_zh(r["word"], r["zh"]), axis=1)
 
-    # ⑥ 复数兜底（仍保留你原逻辑）
+    # ⑥ 复数兜底
     need_plural = df["zh"].eq("") & df["word"].str.endswith("s")
     df.loc[need_plural, "zh"] = df.loc[need_plural, "word"].map(lambda w: _plural_fallback(w, _ec_dict))
 
     # ⑦ 清洗/分行
     df["zh"] = df["zh"].map(_format_zh)
 
-    # ⑧ 仍为空 -> 最终兜底为“未收录”
+    # ⑧ 仍为空 -> “未收录”
     df["zh"] = df["zh"].replace("", "未收录")
 
-    # ⑨ 显示层大小写（含你的专有名词自动识别/人名表）
+    # ⑨ 显示层大小写
     df["word"] = df["word"].map(_display_casing)
 
     df_freq = df.sort_values(["count", "word"], ascending=[False, True]).reset_index(drop=True)
@@ -542,9 +585,9 @@ async def upload(request: Request, file: UploadFile = File(...)):
         t1 = time.perf_counter()
         print(f"[TIMER] read bytes: {t1 - t0:.3f}s")
 
-        # 阶段 2：提取文本（已优化）
+        # 阶段 2：提取文本
         text = _read_text_from_upload(file.filename, data)
-        _detect_proper_nouns_from_text(text)  # ← 新增：本篇文档的专有名词检测
+        _detect_proper_nouns_from_text(text)
         t2 = time.perf_counter()
         print(f"[TIMER] extract text: {t2 - t1:.3f}s")
 
