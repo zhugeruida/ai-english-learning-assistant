@@ -316,20 +316,6 @@ ROMAN_MAP = {
     "xi":11,"xii":12,"xiii":13,"xiv":14,"xv":15,"xvi":16,"xvii":17,"xviii":18,"xix":19,"xx":20
 }
 
-# —— 自动专有名词识别（基于正文）——
-DETECTED_PROPER = set()  # 动态收集：本篇文档里识别出的专有名词（小写存）
-
-# 句首常见大写词黑名单（避免把 "The, When, And ..." 识别成专有名词）
-_TITLECASE_STOP = {
-    "the","a","an","and","but","or","nor","for","so","yet",
-    "when","where","what","who","whom","whose","why","which","while",
-    "if","in","on","at","to","of","from","with","without","into","onto","over","under","about","above","below",
-    "he","she","it","they","we","you","i","his","her","its","their","our","your",
-    "this","that","these","those","there","here","then","thus","hence","once",
-}
-
-# 不把月份/星期二次纳入专有名词集（你已有专门规则）
-_MONTHS_DAYS = set(list(MONTHS) + list(WEEKDAYS))
 
 # —— 自动专有名词识别（基于正文）——
 DETECTED_PROPER = set()  # 动态收集：本篇文档里识别出的专有名词（小写存）
