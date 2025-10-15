@@ -252,7 +252,8 @@ def _tokenize(text: str):
         while changed:
             changed = False
             for fw in _FUNC_WORDS:
-                pat = re.compile(rf'([a-z]+)({fw})([a-z]+)', re.IGNORECASE)
+                # ←← 唯一改动：两侧至少 2 个字母，避免把 more/your 等正常词切断
+                pat = re.compile(rf'([a-z]{{2,}})({fw})([a-z]{{2,}})', re.IGNORECASE)
                 new_s, n = pat.subn(r'\1 \2 \3', s)
                 if n > 0:
                     s = new_s
