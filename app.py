@@ -157,19 +157,47 @@ def _preclean_text(text: str) -> str:
     text = _URL_RE.sub(" ", text)
     text = _EMAIL_RE.sub(" ", text)
 
-    # 2) 修补“前字母 + 功能词”被黏连的情形：...Xfrom / ...Xyour / ...Xthe
-    # 例如 takenfrom -> taken from, markyour -> mark your
-    text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
+    # 2) 修补“前单词 + 功能词”被黏连：takenfrom -> taken from, markyour -> mark your
+    text = re.sub(rf"\b([A-Za-z]+)({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
 
-    # 3) 修补“功能词 + 后单词”被黏连的情形：witha -> with a, andit -> and it
-    text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z])", r"\1 \2", text, flags=re.IGNORECASE)
+    # 3) 修补“功能词 + 后单词”被黏连：withfour -> with four, andit -> and it
+    text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z]+)\b", r"\1 \2", text, flags=re.IGNORECASE)
+
+    # 3.1 be动词后面被粘：areconvertedto -> are convertedto
+    text = re.sub(r"\b(are|is|was|were|be|been|being)([A-Za-z]+)\b", r"\1 \2", text, flags=re.IGNORECASE)
+
+    # 3.2 末尾 to 被粘：convertedto -> converted to
+    text = re.sub(r"\b([A-Za-z]+)(to)\b", r"\1 \2", text, flags=re.IGNORECASE)
 
     # 4) 收缩多空格
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
+# —— 疑似截断词修复（针对 researc->research, atmosp->atmosphere 等，仅在词典命中时替换）——
+_TRUNC_TAILS = [
+    "e","r","d","s","h",
+    "er","ed","es","ly","al",
+    "ion","ment","ing","ive","ous","ity",
+    "her","here","phere","arch","ph","ch","re",
+    "ther"
+]
+def _try_repair_tail(w: str) -> str:
+    if len(w) < 4 or w in _ec_dict:
+        return w
+    wl = w.lower()
+    if wl in _ec_dict:
+        return wl
+    for suf in _TRUNC_TAILS:
+        cand = wl + suf
+        if cand in _ec_dict:
+            return cand
+    return w
+
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
+
+    # 先做一遍预清洗（拆 withfour/markyour/areconvertedto 等）
+    text = _preclean_text(text)
 
     # —— 预清洗：只做你要的三件事 ——
     # ① 忽略 URL（含 http(s) 与 www.）
@@ -205,7 +233,6 @@ def _tokenize(text: str):
             toks.append("'s")
         else:
             toks.append(w)
-        # ……上一段：构造完 toks 之后
     # 额外处理：人名 + ’ll / 'll  => 仅保留人名（不影响 we'll/you'll 等）
     fixed = []
     for w in toks:
@@ -217,7 +244,6 @@ def _tokenize(text: str):
         fixed.append(w)
     toks = fixed
 
-  
     # 你之前的“单字母+后词”首字母补全的防误拼策略保持不变（略）
     stitched = []
     i = 0
@@ -233,6 +259,9 @@ def _tokenize(text: str):
                     continue
         stitched.append(w)
         i += 1
+
+    # stitched 构造完之后 —— 对“未命中词典且像是少尾巴”的做一次轻量修复
+    stitched = [_try_repair_tail(w) for w in stitched]
 
     allow_single = {"a", "i", "v", "x"}
     toks = [w for w in stitched if (len(w) > 1) or (w in allow_single)]
@@ -442,13 +471,10 @@ def _build_dataframe(tokens):
     df["zh"] = df.apply(lambda r: MANUAL_CONTRACTIONS.get(r["word"], r["zh"]), axis=1).astype(str)
 
     # ③.1 数字+d 的专业缩略：2d / 3d / 其他 nd
-    #    —— 只补“尚无释义”的词，不影响已命中的词典/缩略/罗马数字逻辑
-    # 特别按你的话术
     mask_3d = df["word"].str.lower().eq("3d")
     mask_2d = df["word"].str.lower().eq("2d")
     df.loc[mask_3d & df["zh"].eq(""), "zh"] = "abbr. 三维的（three dimensional）；三维（three dimensions）"
     df.loc[mask_2d & df["zh"].eq(""), "zh"] = "abbr. 2维（2 dimensional）"
-    # 其它 nd 的通用兜底
     mask_nd = df["word"].str.match(r"^\d+d$", na=False)
     df.loc[mask_nd & df["zh"].eq(""), "zh"] = df.loc[mask_nd & df["zh"].eq(""), "word"].map(
         lambda w: f"abbr. {w[:-1]}维（{w[:-1]} dimensional）"
