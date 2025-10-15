@@ -158,7 +158,6 @@ def _preclean_text(text: str) -> str:
     text = _EMAIL_RE.sub(" ", text)
 
     # 2) 修补“前字母 + 功能词”被黏连的情形：...Xfrom / ...Xyour / ...Xthe
-    # 例如 takenfrom -> taken from, markyour -> mark your
     text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
 
     # 3) 修补“功能词 + 后单词”被黏连的情形：witha -> with a, andit -> and it
@@ -171,20 +170,27 @@ def _preclean_text(text: str) -> str:
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # === 【新增-最小增量 1】合字标准化 + 下划线/题号清理 ===
-    text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
+    # === 新增（1/3）：更完整的合字 & 软连字符标准化 ===
+    # 历史合字：ﬁ/ﬂ/ﬃ/ﬄ（已有）+ ﬆ(st) / ﬅ(ft)；软连字符 U+00AD
+    text = (text
+            .replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl")
+            .replace("ﬆ", "st").replace("ﬅ", "ft").replace("\u00ad", ""))
+    # 同时把成段下划线/题号痕迹去掉
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
 
-    # —— 预清洗（保留）：忽略 URL；拆驼峰 ===
-    text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    # —— 预清洗：只做你要的三件事 ——
+    text = re.sub(r'https?://\S+|www\.\S+', ' ', text)                 # 忽略 URL
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)                   # 拆驼峰
+    _CONNECTORS = ('the','that','your','our','their','his','her','my',
+                   'answer','answers','phrases','demand')              # 夹心词拆分
+    for w in _CONNECTORS:
+        pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
+        text = pat.sub(r'\1 \2 \3', text)
 
-    # === 【删除-最小增量】取消“夹心词硬拆循环”以避免 together/another 等被误切 ===
-    # （原来这里遍历 _CONNECTORS 在词内强插空格，已移除）
-
-    # （以下与你原来一致）
+    # —— 正式抽词 ——（与你原来一致）
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
-    # 先按所有权拆分（you're -> you + 's; boys' -> boy + 's）
+
+    # 所有权拆分
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -201,6 +207,7 @@ def _tokenize(text: str):
             toks.append("'s")
         else:
             toks.append(w)
+
     # 人名 + ’ll / 'll  => 仅保留人名（不影响 we'll/you'll 等）
     fixed = []
     for w in toks:
@@ -212,7 +219,7 @@ def _tokenize(text: str):
         fixed.append(w)
     toks = fixed
 
-    # 你之前的“单字母+后词”首字母补全的防误拼策略保持不变
+    # 你之前的单字母拼接防误拼策略保持不变
     stitched = []
     i = 0
     while i < len(toks):
@@ -228,7 +235,7 @@ def _tokenize(text: str):
         stitched.append(w)
         i += 1
 
-    # === 【新增-最小增量 2】对“未命中词典”的 token 做保守救援切分 + 词典贪心切分 ===
+    # === 新增（2/3）：功能词黏连拆分 + 单字母回填修复 ===
     _FUNC_WORDS = {
         'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
         'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about',
@@ -242,7 +249,7 @@ def _tokenize(text: str):
     }
 
     def _split_by_func_words(s: str) -> str:
-        """在一个未知 token 内按功能词插空格（多轮），如 areconvertedto -> are converted to / withfour -> with four"""
+        """在一个未知 token 内按功能词插空格（多轮），并修复左右只有 1 个字母外溢的情况"""
         changed = True
         while changed:
             changed = False
@@ -252,11 +259,29 @@ def _tokenize(text: str):
                 if n > 0:
                     s = new_s
                     changed = True
+
+        # —— 单字母回填： [left][fw][1字母] 或 [1字母][fw][right]
+        # 例如 rangingfrom → rangin from g （先前效果），此处回填为 ranging from
+        def _fix_bleed_left(m):
+            left, fw, r1 = m.group(1), m.group(2), m.group(3)
+            cand = left + r1
+            return (cand + " " + fw) if cand in _ec_dict else m.group(0)
+
+        def _fix_bleed_right(m):
+            l1, fw, right = m.group(1), m.group(2), m.group(3)
+            cand = l1 + right
+            return (cand + " " + fw) if cand in _ec_dict else m.group(0)
+
+        for fw in _FUNC_WORDS:
+            s = re.sub(rf'([a-z]+)\s+({fw})\s+([a-z])', _fix_bleed_left, s)
+            s = re.sub(rf'([a-z])\s+({fw})\s+([a-z]+)', _fix_bleed_right, s)
+
         return s
 
     from functools import lru_cache
     @lru_cache(maxsize=2048)
     def _greedy_dict_cut(s: str):
+        """基于词典的贪心最大匹配：仅用于未知且较长的 token。"""
         sl = s.lower()
         if sl in _ec_dict or sl in _FUNC_WORDS:
             return [sl]
@@ -288,29 +313,40 @@ def _tokenize(text: str):
                     tmp.append(p)
                 else:
                     cut = _greedy_dict_cut(p)
-                    if cut:
-                        tmp.extend(cut)
-                    else:
-                        tmp.append(p)
+                    tmp.extend(cut if cut else [p])
             repaired.extend(tmp)
             continue
         cut = _greedy_dict_cut(wl)
-        if cut:
-            repaired.extend(cut)
-        else:
-            repaired.append(wl)
+        repaired.extend(cut if cut else [wl])
 
-    # === 【新增-最小增量 3】二字母噪声过滤（保留少数白名单 + 词典命中）
-    TWO_LETTER_KEEP = {
-        'to','of','or','in','on','by','at','as','is','we','he','be','do','so','no','go','up','us','if','me','my','an','am'
-    }
+    # === 新增（3/3）：仅对“未知且较长”的 token 做轻量词尾补全 ===
+    def _complete_by_prefix(w: str):
+        """在词典中寻找以 w 为前缀、长度≤w+4 的最短候选；找不到返回 None"""
+        wl = w.lower()
+        if wl in _ec_dict or len(wl) < 4:
+            return None
+        best = None
+        wlen = len(wl)
+        # 遍历词典键（已在内存中）
+        for k in _ec_dict.keys():
+            if k.startswith(wl):
+                if wlen < len(k) <= wlen + 4:
+                    if (best is None) or (len(k) < len(best)):
+                        best = k
+                        if len(best) == wlen + 1:  # 已经最短
+                            break
+        return best
+
+    final_tokens = []
+    for w in repaired:
+        if (w not in _ec_dict) and (w not in _FUNC_WORDS) and len(w) >= 4:
+            comp = _complete_by_prefix(w)
+            final_tokens.append(comp if comp else w)
+        else:
+            final_tokens.append(w)
+
     allow_single = {"a", "i", "v", "x"}
-    toks = [
-        w for w in repaired
-        if (len(w) > 2)
-        or (len(w) == 1 and w in allow_single)
-        or (len(w) == 2 and (w in TWO_LETTER_KEEP or w in _ec_dict))
-    ]
+    toks = [w for w in final_tokens if (len(w) > 1) or (w in allow_single)]
     return toks
 
 # ---------- 显示与释义清洗 ----------
@@ -345,7 +381,7 @@ MANUAL_CONTRACTIONS = {
     "isn't": "不是（= is not）", "isn’t": "不是（= is not）",
     "hasn't": "没有（= has not）", "hasn’t": "没有（= has not）",
     "haven't": "没有（= have not）", "haven’t": "没有（= have not）",
-    "hadn't": "没有（= had not）", "hadn’t": "没有（= had not）",
+    "hadn't": "没有（= had not）", "hadn’t": "没有（= have not）",
     "won't": "不会（= will not）", "won’t": "不会（= will not）",
     "wouldn't": "不会；不愿（= would not）", "wouldn’t": "不会；不愿（= would not）",
     "can't": "不能（= cannot）", "can’t": "不能（= cannot）",
@@ -375,7 +411,7 @@ MANUAL_CONTRACTIONS = {
     "he'll": "contr. 他将/他会（= he will / he shall）", "he’ll": "contr. 他将/他会（= he will / he shall）",
 
     "she's": "contr. 她是/她有（= she is / she has）", "she’s": "contr. 她是/她有（= she is / she has）",
-    "she'd": "contr. 她愿意/她已经/她应该（= she would / she had / she should）", "she’d": "contr. 她愿意/她已经/她应该（= she would / she had / she should）",
+    "she'd": "contr. 她愿意/她已经/她应该（= she would / she had / she should）", "she’d": "contr. 她愿意/她已经/她应该（= she would / she should / she had）",
     "she'll": "contr. 她将/她会（= she will / she shall）", "she’ll": "contr. 她将/她会（= she will / she shall）",
 
     "it's": "contr. 它是/它有（= it is / it has）", "it’s": "contr. 它是/它有（= it is / it has）",
@@ -403,11 +439,8 @@ ROMAN_MAP = {
     "xi":11,"xii":12,"xiii":13,"xiv":14,"xv":15,"xvi":16,"xvii":17,"xviii":18,"xix":19,"xx":20
 }
 
-
 # —— 自动专有名词识别（基于正文）——
-DETECTED_PROPER = set()  # 动态收集：本篇文档里识别出的专有名词（小写存）
-
-# 句首常见大写词黑名单（避免把 "The, When, And ..." 识别成专有名词）
+DETECTED_PROPER = set()
 _TITLECASE_STOP = {
     "the","a","an","and","but","or","nor","for","so","yet",
     "when","where","what","who","whom","whose","why","which","while",
@@ -415,41 +448,26 @@ _TITLECASE_STOP = {
     "he","she","it","they","we","you","i","his","her","its","their","our","your",
     "this","that","these","those","there","here","then","thus","hence","once",
 }
-
-# 数词 / 代词 / 常见功能词：不作为专有名词（解决 Two / My / Men / Part 等误判）
 _COMMON_LOWER_STOP = {
     "one","two","three","four","five","six","seven","eight","nine","ten",
     "first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth",
     "part","section","passage","dialogue","answer","sheet","points","choice","choices",
     "men","women","time","more","from","about","my","our","your",
 }
-
 _MONTHS_DAYS = set(list(MONTHS) + list(WEEKDAYS))
-
-# TitleCase 候选（含连字符），但先不过滤句首，只做统计
 _PROPER_RE = re.compile(r"\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\b")
-
-# 统一的小写词扫描
 _WORD_LOWER_RE = re.compile(r"\b([a-z]+(?:-[a-z]+)?)\b")
 
 def _detect_proper_nouns_from_text(raw_text: str):
-    """
-    仅扫描一遍原始文本，统计 TitleCase 与 lower 的次数：
-    - 只有当某个词（小写形态）在全文 TitleCase 次数 >= 2 且 lower 次数 == 0 时，
-      才视为“很可能是专有名词”（并且不在各类 stop 表里，且不是月份/星期）。
-    """
     DETECTED_PROPER.clear()
     cap_cnt = Counter()
     low_cnt = Counter()
-
     for m in _PROPER_RE.finditer(raw_text):
         wl = m.group(1).lower()
         cap_cnt[wl] += 1
-
     for m in _WORD_LOWER_RE.finditer(raw_text):
         wl = m.group(1).lower()
         low_cnt[wl] += 1
-
     for wl, c in cap_cnt.items():
         if c >= 2 and low_cnt.get(wl, 0) == 0:
             if wl in _TITLECASE_STOP or wl in _COMMON_LOWER_STOP or wl in _MONTHS_DAYS or wl == "i":
