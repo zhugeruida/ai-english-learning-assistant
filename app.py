@@ -255,35 +255,31 @@ def _tokenize(text: str):
 
         handled = False
 
-        # 1) 前缀功能词：or+phr -> 'or' + ('phr'并尝试与下一 token 合并成 phrase)
+        # 1) 前缀功能词
         for fw in SMALL_FWS:
             if t.startswith(fw) and 1 <= len(t) - len(fw) <= 3:
                 tail = t[len(fw):]
-                # 试着与下一 token 合并（如 'phr' + 'ase' -> 'phrase'）
                 if i + 1 < n and (tail + stitched[i+1].lower()) in _ec_dict:
                     rescued.append(fw)
                     rescued.append(tail + stitched[i+1].lower())
                     i += 2
                 else:
-                    rescued.append(fw)  # 丢弃短尾残片
+                    rescued.append(fw)
                     i += 1
                 handled = True
                 break
         if handled:
             continue
 
-        # 2) 后缀功能词：g+from / vered+to / tle+to 等
+        # 2) 后缀功能词
         for fw in SMALL_FWS:
             if t.endswith(fw) and 1 <= len(t) - len(fw) <= 4:
                 pre = t[:-len(fw)]
-                # 与上一 token 合并（如 'con' + 'verted'）
                 if rescued and (rescued[-1] + pre) in _ec_dict:
                     rescued[-1] = (rescued[-1] + pre)
-                # 或与下一 token 合并（如 'rec' + 'ord'）
                 elif i + 1 < n and (pre + stitched[i+1].lower()) in _ec_dict:
                     rescued.append(pre + stitched[i+1].lower())
                     i += 1
-                # pre 本身不是词，直接丢弃
                 rescued.append(fw)
                 i += 1
                 handled = True
@@ -569,6 +565,87 @@ def _plural_fallback(word: str, base_zh_lookup) -> str:
             return f"{_format_zh(zh)}（复数）"
     return ""
 
+# === 新增：智能兜底翻译器所需：后缀/正则 ===
+_SUFFIXES = [
+    ("ing", ""), ("ed", ""), ("er", ""), ("est", ""), ("ly", ""),
+    ("tion", "te"), ("sion", "de"), ("ment",""), ("ness",""),
+    ("able",""), ("ible",""), ("al",""), ("ous",""), ("ive",""),
+    ("ize",""), ("ise","")
+]
+_ABBR_RE   = re.compile(r"^[A-Z]{2,}$")
+_ORD_RE    = re.compile(r"^\d+(st|nd|rd|th)$", re.IGNORECASE)
+_MODEL1_RE = re.compile(r"^\d+[a-z]+$", re.IGNORECASE)
+_MODEL2_RE = re.compile(r"^[a-z]+\d+$", re.IGNORECASE)
+
+def _fallback_guess(word: str, cur_zh: str) -> str:
+    """ 对仍为空的 zh 做友好兜底，避免出现‘未收录’ """
+    if cur_zh:
+        return cur_zh
+
+    wshow = _display_casing(word)
+    wl = word.lower()
+
+    # 1) 专有名词
+    if (wl in DETECTED_PROPER) or (word[:1].isupper() and wl not in _TITLECASE_STOP):
+        return "专有名词（人名/地名/机构名）"
+
+    # 2) 全大写缩写
+    if _ABBR_RE.match(word):
+        return "abbr. 缩写，含义视上下文"
+
+    # 3) 数字/序数/型号
+    if _ORD_RE.match(word):
+        return "序数词"
+    if _MODEL1_RE.match(word) or _MODEL2_RE.match(word):
+        return "型号/代码"
+    if word.isdigit():
+        return "数值/编号"
+
+    # 4) 连字符词：片段拼译
+    if "-" in word:
+        parts = [p for p in word.split("-") if p]
+        zh_parts = []
+        for p in parts:
+            base = _ec_dict.get(p.lower(), "")
+            if not base:
+                if p[:1].isupper():
+                    zh_parts.append("专有名词")
+                elif _ABBR_RE.match(p):
+                    zh_parts.append("缩写")
+                elif _MODEL1_RE.match(p) or _MODEL2_RE.match(p) or p.isdigit():
+                    zh_parts.append("型号/编号")
+                else:
+                    done = False
+                    for suf, rep in _SUFFIXES:
+                        if p.lower().endswith(suf) and len(p) > len(suf)+1:
+                            stem = (p[:-len(suf)] + rep).lower()
+                            base2 = _ec_dict.get(stem, "")
+                            if base2:
+                                zh_parts.append(_format_zh(base2) + "（派生）")
+                                done = True
+                                break
+                    if not done:
+                        zh_parts.append(p)
+            else:
+                zh_parts.append(_format_zh(base))
+        return "-".join(zh_parts)
+
+    # 5) 形态派生（单词）
+    for suf, rep in _SUFFIXES:
+        if wl.endswith(suf) and len(wl) > len(suf)+1:
+            stem = wl[:-len(suf)] + rep
+            base = _ec_dict.get(stem, "")
+            if base:
+                return _format_zh(base) + "（派生）"
+
+    # 6) 复数再兜一次
+    plural_try = _plural_fallback(wl, _ec_dict)
+    if plural_try:
+        return plural_try
+
+    # 7) 最终兜底
+    return f"保留原词：{wshow}（暂缺词典释义）"
+
 def _build_dataframe(tokens):
     ctr = Counter(tokens)
     first_pos = {}
@@ -626,7 +703,8 @@ def _build_dataframe(tokens):
                     seg_zh.append(_format_zh(z))
             if seg_zh:
                 return "-".join(seg_zh)
-            return "未收录"
+            # 关键改动：不给“未收录”，交给最终兜底
+            return ""
         return cur
 
     df["zh"] = df.apply(lambda r: _hyphen_zh(r["word"], r["zh"]), axis=1)
@@ -638,8 +716,8 @@ def _build_dataframe(tokens):
     # ⑦ 清洗/分行
     df["zh"] = df["zh"].map(_format_zh)
 
-    # ⑧ 仍为空 -> “未收录”
-    df["zh"] = df["zh"].replace("", "未收录")
+    # ⑧ 最终兜底（替代原来的 "未收录"）
+    df["zh"] = df.apply(lambda r: _fallback_guess(r["word"], r["zh"]), axis=1)
 
     # ⑨ 显示层大小写
     df["word"] = df["word"].map(_display_casing)
