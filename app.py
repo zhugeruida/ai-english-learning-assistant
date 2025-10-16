@@ -10,10 +10,159 @@ import re
 import unicodedata
 import pandas as pd
 from collections import Counter
-import csv    # 轻量读取 ecdict.csv
 import time   # 日志查看哪一步耗时
 import tempfile  # DOCX 临时文件更稳健
 import uuid      # 并发隔离：会话 ID
+
+# ========= 新增：SQLite + LRU 词典实现（只替换原大字典，其他不动）=========
+import sqlite3
+import threading
+from collections import OrderedDict
+from typing import Optional, Iterator
+
+
+class SQLiteEcdict:
+    """
+    轻量字典接口，保持与原 _ec_dict 用法一致：
+      - __contains__(key)
+      - get(key, default="")
+      - __getitem__(key)
+      - 允许人工覆盖：obj[key] = value（仅进程内内存，不回写 DB）
+
+    特性：
+      - 查询自动转小写
+      - LRU 缓存命中后不访问 DB
+      - 线程安全（单连接 + 全局锁；或使用 sqlite 内部并发）
+    """
+    def __init__(self, db_path: str, table: str = "ecdict", word_col: str = "word", zh_col: str = "translation",
+                 cache_size: int = 50000):
+        self.db_path = db_path
+        self.table = table
+        self.word_col = word_col
+        self.zh_col = zh_col
+        self.cache_size = max(1024, int(cache_size))
+        self._lock = threading.RLock()
+        # 连接：只读模式（若文件系统支持）；否则普通模式
+        uri_path = f"file:{db_path}?mode=ro"
+        try:
+            self._conn = sqlite3.connect(uri_path, uri=True, check_same_thread=False)
+        except Exception:
+            # 回退到普通打开方式（依然只用于读）
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        # 两级缓存：值缓存（word -> str 或 None）与存在性缓存（word -> True/False）
+        self._val_cache = OrderedDict()
+        self._exist_cache = OrderedDict()
+        # 人工覆盖（优先于 DB 与缓存）
+        self._overrides = {}
+
+        # 启动时做一次元数据探测，确保列存在（失败就抛错，和原始 CSV 缺列报错行为等价）
+        try:
+            cur = self._conn.execute(f"PRAGMA table_info({self.table})")
+            cols = {row["name"].lower() for row in cur.fetchall()}
+        except Exception as e:
+            raise RuntimeError(f"无法读取 SQLite 元数据：{e}")
+        need = {self.word_col.lower(), self.zh_col.lower()}
+        if not need.issubset(cols):
+            raise RuntimeError(f"SQLite 表缺少必须列：{self.word_col} / {self.zh_col}")
+
+    # LRU 基元
+    def _lru_get(self, cache: OrderedDict, key):
+        try:
+            with self._lock:
+                val = cache.pop(key)
+                cache[key] = val
+                return val
+        except KeyError:
+            return None
+
+    def _lru_set(self, cache: OrderedDict, key, val):
+        with self._lock:
+            if key in cache:
+                cache.pop(key)
+            cache[key] = val
+            if len(cache) > self.cache_size:
+                cache.popitem(last=False)
+
+    # 查询 DB
+    def _query_db(self, key_lc: str) -> Optional[str]:
+        try:
+            cur = self._conn.execute(
+                f"SELECT {self.zh_col} FROM {self.table} WHERE LOWER({self.word_col}) = ? LIMIT 1",
+                (key_lc,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            zh = row[0] if isinstance(row, sqlite3.Row) else row[0]
+            zh = (zh or "").strip()
+            return zh if zh else ""
+        except Exception:
+            # 查询异常视为未命中（与原来缺词等价）
+            return None
+
+    # 公共接口
+    def get(self, key: str, default: str = "") -> str:
+        if not key:
+            return default
+        k = key.strip().lower()
+        # 覆盖优先
+        if k in self._overrides:
+            return self._overrides[k]
+        # 值缓存
+        cached = self._lru_get(self._val_cache, k)
+        if cached is not None:
+            return cached if cached != "__NONE__" else default
+        # DB 查询
+        val = self._query_db(k)
+        if val is None:
+            # 记为不存在
+            self._lru_set(self._val_cache, k, "__NONE__")
+            self._lru_set(self._exist_cache, k, False)
+            return default
+        # 命中
+        self._lru_set(self._val_cache, k, val if val != "" else "")
+        self._lru_set(self._exist_cache, k, True)
+        return val if val != "" else default
+
+    def __contains__(self, key: str) -> bool:
+        if not key:
+            return False
+        k = key.strip().lower()
+        if k in self._overrides:
+            return True
+        cached = self._lru_get(self._exist_cache, k)
+        if cached is not None:
+            return bool(cached)
+        # 不撞 value 缓存的话，再查 DB 一次（会同步 value/exist 双缓存）
+        _ = self.get(k, "")
+        cached2 = self._lru_get(self._exist_cache, k)
+        return bool(cached2)
+
+    def __getitem__(self, key: str) -> str:
+        v = self.get(key, None)  # 与 dict 行为一致：KeyError 仅在“确认不存在”时抛
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    # 仅供人工覆盖（如 "'s"）
+    def __setitem__(self, key: str, value: str):
+        k = (key or "").strip().lower()
+        with self._lock:
+            self._overrides[k] = value
+
+    # 为了与 pandas 的“映射对象”兼容，提供最小实现
+    def keys(self) -> Iterator[str]:  # 不做全量迭代，避免扫库；保持空迭代即可
+        return iter(())
+
+    def items(self) -> Iterator[tuple[str, str]]:
+        return iter(())
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 
 # ========= 新增：优先尝试 PyPDF =========
@@ -100,32 +249,18 @@ def _put_session(sid: str, filename, df_freq, df_pos, page_size=500):
         except Exception:
             pass
 
-# 读取 ECDICT（轻量：只取需要列并存为 dict，降低内存占用）
-DICT_PATH = "data/ecdict.csv"
-if not os.path.exists(DICT_PATH):
-    raise RuntimeError("缺少 data/ecdict.csv，请放到项目 data/ 目录下。")
+# ==================（替换部分）词典：改为 SQLite + LRU ==================
+DB_PATH = os.getenv("ECDICT_DB_PATH", "data/ecdict.sqlite3")
+if not os.path.exists(DB_PATH):
+    raise RuntimeError("缺少 data/ecdict.sqlite3（或设置 ECDICT_DB_PATH）。请提供包含 word/translation 列的 SQLite 数据库。")
 
-_ec_dict = {}
-with open(DICT_PATH, "r", encoding="utf-8", newline="") as f:
-    reader = csv.DictReader(f)
-    word_key = None
-    zh_key = None
-    for h in reader.fieldnames or []:
-        hl = h.strip().lower()
-        if hl == "word":
-            word_key = h
-        elif hl in ("translation", "zh", "trans"):
-            zh_key = h
-    if word_key is None or zh_key is None:
-        raise RuntimeError("ecdict.csv 缺少必须字段：word / translation")
+_ECDICT_CACHE_SIZE = int(os.getenv("ECDICT_CACHE_SIZE", "50000"))
+_ec_dict = SQLiteEcdict(DB_PATH, table=os.getenv("ECDICT_TABLE", "ecdict"),
+                        word_col=os.getenv("ECDICT_WORD_COL", "word"),
+                        zh_col=os.getenv("ECDICT_ZH_COL", "translation"),
+                        cache_size=_ECDICT_CACHE_SIZE)
 
-    for row in reader:
-        w = (row.get(word_key) or "").strip().lower()
-        zh = (row.get(zh_key) or "").strip()
-        if w:
-            _ec_dict[w] = zh
-
-# 给 possessive "'s" 固定翻译
+# 给 possessive "'s" 固定翻译（保持与原行为一致；仅内存覆盖，不写 DB）
 _ec_dict["'s"] = "…的"
 
 # ---------- 分词 ----------
@@ -803,7 +938,7 @@ def _build_dataframe(tokens):
         "pos":   [first_pos[w] for w in ctr.keys()],
     })
 
-    # ① 基础词典
+    # ① 基础词典（保持调用形式不变）
     df["zh"] = df["word"].str.lower().map(_ec_dict).fillna("")
 
     # ② 罗马数字
