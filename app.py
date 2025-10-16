@@ -149,27 +149,43 @@ _SUFFIX_FUNCS = r"(?:from|for|the|that|this|these|those|your|our|their|and|to|of
 _PREFIX_FUNCS = r"(?:and|or|but|for|to|of|in|on|at|from|by|the|that|this|these|those|with|without)"
 
 def _preclean_text(text: str) -> str:
+    # 先去 URL / 邮箱
     text = _URL_RE.sub(" ", text)
     text = _EMAIL_RE.sub(" ", text)
+
+    # 清理常见水印/站点残留（保守小名单，不影响正文）
+    WATERMARK_PAT = re.compile(r"(?i)\b(zjuxz|xuezhan|zju|zjuxz\.cn)\b")
+    text = WATERMARK_PAT.sub(" ", text)
+
+    # 逗号/句点之间补空格（防 A,B→ab）
+    text = re.sub(r"([A-Za-z])[,\uFF0C]\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])[.\u3002]\s*([A-Za-z])", r"\1 \2", text)
+
+    # 常见“词尾+功能词”黏连修补
     text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
     text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z])", r"\1 \2", text, flags=re.IGNORECASE)
+
+    # 收紧空格
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # ① 行尾断词还原（de-hyphenation）
+    # ===== (A) 行尾断词修复：连字符断词合并；普通换行保空格 =====
+    # ① 带连字符的跨行：合回一个词
     text = re.sub(r"([A-Za-z])-\s*\n\s*([A-Za-z])", r"\1\2\n", text)
+    # ② 无连字符、但两侧都是字母的换行：变成空格（One\nA → One A）
+    text = re.sub(r"([A-Za-z])\s*\n\s*([A-Za-z])", r"\1 \2", text)
 
-    # 合字/下划线清理
+    # ===== 合字/下划线清理 =====
     text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
 
     # ② 斜杠连写拆分（仅在字母两侧）
     text = re.sub(r"(?<=\w)[\\/](?=\w)", " ", text)
 
-    # 预清洗
+    # ===== 预清洗（URL/驼峰/栏目词黏连）=====
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
     _CONNECTORS = ('the','that','your','our','their','his','her','my','answer','answers','phrases','demand')
@@ -177,6 +193,16 @@ def _tokenize(text: str):
         pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
         text = pat.sub(r'\1 \2 \3', text)
 
+    # ===== (B) 单字母 I/A 后若直接跟小写，强制插空格：Ican→I can、Aand→A and =====
+    text = re.sub(r"\b([IA])([a-z])", r"\1 \2", text)
+
+    # ===== (C) 罗马数字与词拼接断开：partI→part I、sectionV→section V（仅大写罗马数字）=====
+    text = re.sub(r"\b([A-Za-z]{2,})([IVX]{1,3})\b", r"\1 \2", text)
+
+    # ====== 统一调用预清洗（含水印清理与逗号间补空格）======
+    text = _preclean_text(text)
+
+    # 提取原始 token
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
     # 所有格拆分
@@ -208,7 +234,7 @@ def _tokenize(text: str):
         fixed.append(w)
     toks = fixed
 
-    # 黏连修复（更强：最长看 3 个 token 试合并）
+    # ===== 黏连修复（最长看 3 个 token 合并）=====
     stitched = []
     i = 0
     while i < len(toks):
@@ -232,8 +258,8 @@ def _tokenize(text: str):
         if merged:
             continue
 
-        # 保留原来的“单字母前缀 + 后词”兜底
-        if len(w1) == 1 and w1.isalpha() and w2:
+        # ===== (E) 禁止 'a' / 'i' 作为前缀与后词粘连 =====
+        if len(w1) == 1 and w1.isalpha() and w2 and w1 not in {"a", "i"}:
             cand = (w1 + w2)
             if len(w2) >= 2 and w2[0].isalpha() and cand in _ec_dict:
                 stitched.append(cand)
@@ -243,10 +269,41 @@ def _tokenize(text: str):
         stitched.append(w1)
         i += 1
 
-    # === 新增：功能词“边缘救援”（只保留功能词 + 尝试邻接合并）===
+    # ===== (F) 邻接残片“回拼”为词典词 + 功能词边缘救援 =====
     SMALL_FWS = {
         'to','the','from','your','our','their','his','her','my','and','or','of','in','on','for'
     }
+
+    # 针对特例：int + his → in + this；the + re → there；on + eof → one + of
+    def _pair_fix(seq):
+        out = []
+        i = 0
+        while i < len(seq):
+            w = seq[i]
+            nxt = seq[i+1] if i+1 < len(seq) else None
+            if nxt:
+                # the + re -> there
+                if w == "the" and nxt == "re":
+                    out.append("there")
+                    i += 2
+                    continue
+                # int + his -> in + this （来自 'In this' 被 OCR 黏连）
+                if w == "int" and nxt == "his":
+                    out.extend(["in", "this"])
+                    i += 2
+                    continue
+                # on + eof -> one + of （'one of' 被拆错）
+                if w == "on" and nxt == "eof":
+                    out.extend(["one", "of"])
+                    i += 2
+                    continue
+            out.append(w)
+            i += 1
+        return out
+
+    stitched = _pair_fix(stitched)
+
+    # 功能词“边缘救援”：保留功能词并尝试把旁边残片合回词典词
     rescued = []
     i = 0
     while i < len(stitched):
@@ -254,8 +311,7 @@ def _tokenize(text: str):
         n = len(stitched)
 
         handled = False
-
-        # 1) 前缀功能词
+        # 1) 前缀功能词残片：orphr -> or + phrase（仅示意，按词典判断）
         for fw in SMALL_FWS:
             if t.startswith(fw) and 1 <= len(t) - len(fw) <= 3:
                 tail = t[len(fw):]
@@ -271,7 +327,7 @@ def _tokenize(text: str):
         if handled:
             continue
 
-        # 2) 后缀功能词
+        # 2) 后缀功能词残片：gfrom / veredto 等
         for fw in SMALL_FWS:
             if t.endswith(fw) and 1 <= len(t) - len(fw) <= 4:
                 pre = t[:-len(fw)]
@@ -287,12 +343,20 @@ def _tokenize(text: str):
         if handled:
             continue
 
+        # 3) 语境微修：当 'or' 明显应为 'for'（or + the/a/an/this/that...）
+        if t == "or" and i + 1 < n and stitched[i+1].lower() in {
+            "the","a","an","this","that","these","those","example","instance"
+        }:
+            rescued.append("for")
+            i += 1
+            continue
+
         rescued.append(t)
         i += 1
 
-    stitched = rescued  # 用救援后的序列进入后续流程
+    stitched = rescued
 
-    # 二次修复：功能词裂开 + 贪心切分
+    # ===== 二次修复：功能词裂开 + 贪心切分 =====
     _FUNC_WORDS = {
         'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
         'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about',
@@ -357,13 +421,13 @@ def _tokenize(text: str):
         cut = _greedy_dict_cut(wl)
         repaired.extend(cut if cut else [wl])
 
-    # 噪声过滤：短且非词典的碎片丢弃
+    # ===== (G) 噪声过滤（扩黑名单 + 规则）=====
     allow_single = {"a", "i", "v", "x"}
     ALLOW_2 = {'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'}
     NOISE_2 = {'ou','kf','rw','th','ei'}
-    # 新增：典型 OCR 残片（极小黑名单）
-    NOISE_3 = {'mor','ses','phr'}
-    NOISE_4 = {'toge'}
+    # 典型 OCR 残片（根据你的 PDF 样本加入）
+    NOISE_3 = {'mor','ses','phr','ora','eof'}
+    NOISE_4 = {'toge','rang','gfrom'}
 
     def _is_consonant_only(s: str) -> bool:
         return re.fullmatch(r"[bcdfghjklmnpqrstvwxyz]+", s) is not None
@@ -392,7 +456,7 @@ def _tokenize(text: str):
         if len(w) == 4:
             if w in NOISE_4:
                 continue
-        # 4–5 字母：非词典且非功能词，且“全辅音或元音计数<=1 或字符种类<=2” → 视为噪声
+        # 4–5 字母：非词典且非功能词，且“全辅音或元音计数<=1 或字符种类<=2” → 噪声
         if 4 <= len(w) <= 5 and (w not in _ec_dict) and (w not in _FUNC_WORDS):
             vowels = len(re.findall(r"[aeiou]", w))
             uniq = len(set(w))
