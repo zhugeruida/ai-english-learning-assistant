@@ -10,3 +10,4 @@ python-dotenv
 pdfminer.six
 xlsxwriter
 pypdf>=4.0.0
+gunicorn
