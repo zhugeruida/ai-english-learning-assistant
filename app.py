@@ -44,6 +44,25 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
+
+# ==== Boot 日志（免 Shell 看端口/目录/模板是否存在）====
+@app.on_event("startup")
+def _boot_probe():
+    print("[BOOT] PORT=", os.getenv("PORT"))
+    print("[BOOT] CWD=", os.getcwd())
+    print("[BOOT] has templates/:", os.path.isdir("templates"))
+    print("[BOOT] has static/:", os.path.isdir("static"))
+
+# ==== 只读调试：查看运行时环境 ====
+@app.get("/_debug/env")
+def _debug_env():
+    return {
+        "PORT": os.getenv("PORT"),
+        "cwd": os.getcwd(),
+        "has_templates": os.path.isdir("templates"),
+        "has_static": os.path.isdir("static"),
+    }
+
 # =============== 并发隔离：进程内会话态（不改 UI，靠 Cookie） ===============
 # 旧的全局 STATE 保留作兜底；新增 SESSIONS：sid -> {filename, df_freq, df_pos, page_size}
 STATE = {
@@ -855,6 +874,10 @@ def _build_dataframe(tokens):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+@app.head("/")
+def root_head():
+    return PlainTextResponse("", status_code=200)
 
 @app.post("/upload")
 async def upload(request: Request, file: UploadFile = File(...)):
