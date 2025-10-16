@@ -1,4 +1,3 @@
-# app.py
 from urllib.parse import quote  # 用于 Content-Disposition 的 UTF-8 文件名
 from fastapi import FastAPI, Request, UploadFile, File, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, PlainTextResponse
@@ -13,6 +12,8 @@ import pandas as pd
 from collections import Counter
 import csv    # 轻量读取 ecdict.csv
 import time   # 日志查看哪一步耗时
+import tempfile  # DOCX 临时文件更稳健
+import uuid      # 并发隔离：会话 ID
 
 
 # ========= 新增：优先尝试 PyPDF =========
@@ -43,13 +44,42 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# 进程内状态
+# =============== 并发隔离：进程内会话态（不改 UI，靠 Cookie） ===============
+# 旧的全局 STATE 保留作兜底；新增 SESSIONS：sid -> {filename, df_freq, df_pos, page_size}
 STATE = {
     "filename": None,
     "df_freq": None,
     "df_pos": None,
     "page_size": 500,
 }
+SESSIONS = {}  # type: dict[str, dict]
+
+def _get_sid_from_request(request: Request) -> str | None:
+    return request.cookies.get("sid")
+
+def _get_session_state(request: Request) -> dict | None:
+    sid = _get_sid_from_request(request)
+    if sid and sid in SESSIONS:
+        return SESSIONS[sid]
+    return None
+
+def _ensure_session() -> str:
+    return uuid.uuid4().hex
+
+def _put_session(sid: str, filename, df_freq, df_pos, page_size=500):
+    SESSIONS[sid] = {
+        "filename": filename,
+        "df_freq": df_freq,
+        "df_pos": df_pos,
+        "page_size": page_size,
+    }
+    # 可选：限制总会话数量，超出时随机弹掉一个，避免内存泄漏
+    MAX_SESS = int(os.getenv("MAX_SESSIONS", "200"))
+    if len(SESSIONS) > MAX_SESS:
+        try:
+            SESSIONS.pop(next(iter(SESSIONS)))
+        except Exception:
+            pass
 
 # 读取 ECDICT（轻量：只取需要列并存为 dict，降低内存占用）
 DICT_PATH = "data/ecdict.csv"
@@ -89,7 +119,7 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
     """
     尽量快地把上传文件转成纯文本：
     - PDF：优先 PyPDF（快），失败/少文本再回退到 pdfminer（稳），两者都受页数/字符上限保护
-    - DOCX：python-docx
+    - DOCX：python-docx（临时文件安全写入）
     - 其它：按 utf-8 尝试解码
     """
     name = (fname or "").lower()
@@ -127,12 +157,16 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
 
     # ---------- DOCX ----------
     if name.endswith(".docx") and docx is not None:
-        with io.BytesIO(data) as bio:
-            tmp = ".__tmp__.docx"
-            with open(tmp, "wb") as w:
-                w.write(bio.read())
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tf:
+            tf.write(data)
+            tmp = tf.name
+        try:
             d = docx.Document(tmp)
-            os.remove(tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
         return "\n".join(p.text for p in d.paragraphs)[:MAX_CHARS]
 
     # ---------- 纯文本 ----------
@@ -148,18 +182,31 @@ _EMAIL_RE = re.compile(r"(?i)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
 _SUFFIX_FUNCS = r"(?:from|for|the|that|this|these|those|your|our|their|and|to|of|with|without)"
 _PREFIX_FUNCS = r"(?:and|or|but|for|to|of|in|on|at|from|by|the|that|this|these|those|with|without)"
 
+# —— Unicode 罗马数字 → ASCII（Part Ⅲ / Ⅱ / Ⅰ 等）——
+UNICODE_ROMAN_MAP = {
+    "Ⅰ":"I","Ⅱ":"II","Ⅲ":"III","Ⅳ":"IV","Ⅴ":"V","Ⅵ":"VI","Ⅶ":"VII","Ⅷ":"VIII","Ⅸ":"IX","Ⅹ":"X",
+    "Ⅺ":"XI","Ⅻ":"XII","Ⅼ":"L","Ⅽ":"C","Ⅾ":"D","Ⅿ":"M",
+    "ⅰ":"i","ⅱ":"ii","ⅲ":"iii","ⅳ":"iv","ⅴ":"v","ⅵ":"vi","ⅶ":"vii","ⅷ":"viii","ⅸ":"ix","ⅹ":"x",
+    "ⅺ":"xi","ⅻ":"xii","ⅼ":"l","ⅽ":"c","ⅾ":"d","ⅿ":"m"
+}
+def _normalize_unicode_roman(s: str) -> str:
+    return "".join(UNICODE_ROMAN_MAP.get(ch, ch) for ch in s)
+
 def _preclean_text(text: str) -> str:
-    # 先去 URL / 邮箱
+    # URL / 邮箱
     text = _URL_RE.sub(" ", text)
     text = _EMAIL_RE.sub(" ", text)
 
-    # 清理常见水印/站点残留（保守小名单，不影响正文）
+    # 小白名单水印（文本层）
     WATERMARK_PAT = re.compile(r"(?i)\b(zjuxz|xuezhan|zju|zjuxz\.cn)\b")
     text = WATERMARK_PAT.sub(" ", text)
 
-    # 逗号/句点之间补空格（防 A,B→ab）
-    text = re.sub(r"([A-Za-z])[,\uFF0C]\s*([A-Za-z])", r"\1 \2", text)
-    text = re.sub(r"([A-Za-z])[.\u3002]\s*([A-Za-z])", r"\1 \2", text)
+    # 逗号/句点/分号/冒号/中文顿号之间补空格，防 A;B / A:B / A、B → AB
+    text = re.sub(r"([A-Za-z])[,\uFF0C]\s*([A-Za-z])", r"\1 \2", text)  # 英/中逗号
+    text = re.sub(r"([A-Za-z])[.\u3002]\s*([A-Za-z])", r"\1 \2", text)  # 英句点/中文句号
+    text = re.sub(r"([A-Za-z])[;；]\s*([A-Za-z])",      r"\1 \2", text)  # 分号
+    text = re.sub(r"([A-Za-z])[:：]\s*([A-Za-z])",      r"\1 \2", text)  # 冒号
+    text = re.sub(r"([A-Za-z])、\s*([A-Za-z])",         r"\1 \2", text)  # 中文顿号
 
     # 常见“词尾+功能词”黏连修补
     text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
@@ -172,20 +219,21 @@ def _preclean_text(text: str) -> str:
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
 
-    # ===== (A) 行尾断词修复：连字符断词合并；普通换行保空格 =====
-    # ① 带连字符的跨行：合回一个词
-    text = re.sub(r"([A-Za-z])-\s*\n\s*([A-Za-z])", r"\1\2\n", text)
-    # ② 无连字符、但两侧都是字母的换行：变成空格（One\nA → One A）
-    text = re.sub(r"([A-Za-z])\s*\n\s*([A-Za-z])", r"\1 \2", text)
+    # 统一 Unicode 罗马数字
+    text = _normalize_unicode_roman(text)
 
-    # ===== 合字/下划线清理 =====
+    # ===== (A) 行尾断词修复：连字符断词合并；普通换行保空格 =====
+    text = re.sub(r"([A-Za-z])-\s*\n\s*([A-Za-z])", r"\1\2\n", text)
+    text = re.sub(r"([A-Za-z])\s*\n\s*([A-Za-z])",   r"\1 \2", text)
+
+    # 合字/下划线清理
     text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
 
-    # ② 斜杠连写拆分（仅在字母两侧）
+    # 斜杠连写拆分（仅在字母两侧）
     text = re.sub(r"(?<=\w)[\\/](?=\w)", " ", text)
 
-    # ===== 预清洗（URL/驼峰/栏目词黏连）=====
+    # 预清洗（URL/驼峰/栏目词黏连）
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
     _CONNECTORS = ('the','that','your','our','their','his','her','my','answer','answers','phrases','demand')
@@ -193,13 +241,13 @@ def _tokenize(text: str):
         pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
         text = pat.sub(r'\1 \2 \3', text)
 
-    # ===== (B) 单字母 I/A 后若直接跟小写，强制插空格：Ican→I can、Aand→A and =====
+    # (B) 单字母 I/A 右吸附拆分
     text = re.sub(r"\b([IA])([a-z])", r"\1 \2", text)
 
-    # ===== (C) 罗马数字与词拼接断开：partI→part I、sectionV→section V（仅大写罗马数字）=====
-    text = re.sub(r"\b([A-Za-z]{2,})([IVX]{1,3})\b", r"\1 \2", text)
+    # (C) 词 + 罗马数字（ASCII，因上一步已统一）
+    text = re.sub(r"\b([A-Za-z]{2,})([IVXLCDM]{1,4})\b", r"\1 \2", text)
 
-    # ====== 统一调用预清洗（含水印清理与逗号间补空格）======
+    # 统一调用预清洗（含水印/标点补空格）
     text = _preclean_text(text)
 
     # 提取原始 token
@@ -234,7 +282,7 @@ def _tokenize(text: str):
         fixed.append(w)
     toks = fixed
 
-    # ===== 黏连修复（最长看 3 个 token 合并）=====
+    # 黏连修复（最长看 3 个 token 合并）
     stitched = []
     i = 0
     while i < len(toks):
@@ -258,7 +306,7 @@ def _tokenize(text: str):
         if merged:
             continue
 
-        # ===== (E) 禁止 'a' / 'i' 作为前缀与后词粘连 =====
+        # 禁止 'a' / 'i' 作为前缀与后词粘连
         if len(w1) == 1 and w1.isalpha() and w2 and w1 not in {"a", "i"}:
             cand = (w1 + w2)
             if len(w2) >= 2 and w2[0].isalpha() and cand in _ec_dict:
@@ -269,12 +317,11 @@ def _tokenize(text: str):
         stitched.append(w1)
         i += 1
 
-    # ===== (F) 邻接残片“回拼”为词典词 + 功能词边缘救援 =====
+    # 邻接残片“回拼” & 专项修复
     SMALL_FWS = {
         'to','the','from','your','our','their','his','her','my','and','or','of','in','on','for'
     }
 
-    # 针对特例：int + his → in + this；the + re → there；on + eof → one + of
     def _pair_fix(seq):
         out = []
         i = 0
@@ -287,16 +334,32 @@ def _tokenize(text: str):
                     out.append("there")
                     i += 2
                     continue
-                # int + his -> in + this （来自 'In this' 被 OCR 黏连）
+                # int + his -> in + this
                 if w == "int" and nxt == "his":
                     out.extend(["in", "this"])
                     i += 2
                     continue
-                # on + eof -> one + of （'one of' 被拆错）
+                # on + eof -> one + of
                 if w == "on" and nxt == "eof":
                     out.extend(["one", "of"])
                     i += 2
                     continue
+
+            # 新增：功能词 + 冠词被吸附（ora/fora/anda/ina/ona/toa 以及 *an 变体）
+            _FW, _ART = ("or","for","and","in","on","to"), ("a","an")
+            fixed = False
+            for fw in _FW:
+                for art in _ART:
+                    if w == (fw + art):
+                        out.extend([fw, art])
+                        i += 1
+                        fixed = True
+                        break
+                if fixed:
+                    break
+            if fixed:
+                continue
+
             out.append(w)
             i += 1
         return out
@@ -311,7 +374,7 @@ def _tokenize(text: str):
         n = len(stitched)
 
         handled = False
-        # 1) 前缀功能词残片：orphr -> or + phrase（仅示意，按词典判断）
+        # 1) 前缀功能词残片
         for fw in SMALL_FWS:
             if t.startswith(fw) and 1 <= len(t) - len(fw) <= 3:
                 tail = t[len(fw):]
@@ -327,7 +390,7 @@ def _tokenize(text: str):
         if handled:
             continue
 
-        # 2) 后缀功能词残片：gfrom / veredto 等
+        # 2) 后缀功能词残片
         for fw in SMALL_FWS:
             if t.endswith(fw) and 1 <= len(t) - len(fw) <= 4:
                 pre = t[:-len(fw)]
@@ -343,10 +406,8 @@ def _tokenize(text: str):
         if handled:
             continue
 
-        # 3) 语境微修：当 'or' 明显应为 'for'（or + the/a/an/this/that...）
-        if t == "or" and i + 1 < n and stitched[i+1].lower() in {
-            "the","a","an","this","that","these","those","example","instance"
-        }:
+        # 收紧“or→for”的纠偏：仅用于 for example / for instance
+        if t == "or" and i + 1 < n and stitched[i+1].lower() in {"example", "instance"}:
             rescued.append("for")
             i += 1
             continue
@@ -356,7 +417,7 @@ def _tokenize(text: str):
 
     stitched = rescued
 
-    # ===== 二次修复：功能词裂开 + 贪心切分 =====
+    # 二次修复：功能词裂开 + 贪心切分
     _FUNC_WORDS = {
         'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
         'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about',
@@ -421,12 +482,12 @@ def _tokenize(text: str):
         cut = _greedy_dict_cut(wl)
         repaired.extend(cut if cut else [wl])
 
-    # ===== (G) 噪声过滤（扩黑名单 + 规则）=====
+    # 噪声过滤
     allow_single = {"a", "i", "v", "x"}
     ALLOW_2 = {'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'}
     NOISE_2 = {'ou','kf','rw','th','ei'}
-    # 典型 OCR 残片（根据你的 PDF 样本加入）
-    NOISE_3 = {'mor','ses','phr','ora','eof'}
+    # 注意：去掉 'ora'，避免误删 or a；保留 'eof' 用于上面的专项修复
+    NOISE_3 = {'mor','ses','phr','eof'}
     NOISE_4 = {'toge','rang','gfrom'}
 
     def _is_consonant_only(s: str) -> bool:
@@ -825,13 +886,21 @@ async def upload(request: Request, file: UploadFile = File(...)):
         t4 = time.perf_counter()
         print(f"[TIMER] build dataframe: {t4 - t3:.3f}s")
 
-        # 阶段 5：保存状态 & 跳转
+        # 阶段 5：保存状态（会话隔离 + 兼容旧 STATE） & 跳转
+        sid = _get_sid_from_request(request) or _ensure_session()
+        _put_session(sid, file.filename, df_freq, df_pos, page_size=STATE.get("page_size", 500))
+
+        # 兼容：也写入老 STATE，避免非 Cookie 客户端出问题
         STATE["filename"] = file.filename
         STATE["df_freq"] = df_freq
         STATE["df_pos"] = df_pos
+
         print(f"[TIMER] total: {time.perf_counter() - t0:.3f}s")
 
-        return RedirectResponse(url="/result?sort=freq&page=1", status_code=303)
+        resp = RedirectResponse(url="/result?sort=freq&page=1", status_code=303)
+        # 设置会话 Cookie（不改 UI）
+        resp.set_cookie("sid", sid, httponly=True, samesite="lax")
+        return resp
 
     except Exception as e:
         print(f"[ERROR] {e}")
@@ -855,17 +924,23 @@ def _slice_page(df: pd.DataFrame, page: int, page_size: int):
 
 @app.get("/result", response_class=HTMLResponse)
 def result(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$"), page: int = 1):
-    if STATE["df_freq"] is None:
+    # 优先读会话
+    sess = _get_session_state(request)
+    df_freq = sess["df_freq"] if sess else STATE["df_freq"]
+    df_pos  = sess["df_pos"] if sess else STATE["df_pos"]
+    filename = sess["filename"] if sess else STATE["filename"]
+    page_size = (sess or STATE).get("page_size", 500)
+
+    if df_freq is None:
         return RedirectResponse("/", status_code=303)
 
-    df = STATE["df_freq"] if sort == "freq" else STATE["df_pos"]
-    page_size = STATE["page_size"]
+    df = df_freq if sort == "freq" else df_pos
     sub, cur, pages, total = _slice_page(df, page, page_size)
     return templates.TemplateResponse(
         "result.html",
         {
             "request": request,
-            "filename": STATE["filename"],
+            "filename": filename,
             "rows": sub.to_dict(orient="records"),
             "page": cur,
             "pages": pages,
@@ -877,11 +952,17 @@ def result(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$"), 
 
 # ---------- 导出（跟随当前排序） ----------
 @app.get("/export")
-def export(sort: str = Query("freq", pattern="^(freq|pos)$")):
-    if STATE["df_freq"] is None:
+def export(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$")):
+    # 优先读会话
+    sess = _get_session_state(request)
+    df_freq = sess["df_freq"] if sess else STATE["df_freq"]
+    df_pos  = sess["df_pos"] if sess else STATE["df_pos"]
+    filename = sess["filename"] if sess else STATE["filename"]
+
+    if df_freq is None:
         return RedirectResponse("/", status_code=303)
 
-    df = STATE["df_freq"] if sort == "freq" else STATE["df_pos"]
+    df = df_freq if sort == "freq" else df_pos
     out = df.rename(columns={"count": "出现次数", "word": "单词", "zh": "翻译"}).copy()
     if "序号" not in out.columns:
         out.insert(0, "序号", range(1, len(out) + 1))
@@ -910,7 +991,7 @@ def export(sort: str = Query("freq", pattern="^(freq|pos)$")):
 
     bio.seek(0)
     mode_cn  = "词频降序排列" if sort == "freq" else "出现位置排列"
-    docname  = (STATE["filename"] or "文档").rsplit(".", 1)[0]
+    docname  = (filename or "文档").rsplit(".", 1)[0]
     final_xlsx_name = f"单词（{mode_cn}）—（{docname}）.xlsx"
     headers = {
         "Content-Disposition": f"attachment; filename=\"words.xlsx\"; filename*=UTF-8''{quote(final_xlsx_name)}"
