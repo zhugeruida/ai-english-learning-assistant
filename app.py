@@ -33,6 +33,7 @@ class SQLiteEcdict:
       - 查询自动转小写
       - LRU 缓存命中后不访问 DB
       - 线程安全（单连接 + 全局锁；或使用 sqlite 内部并发）
+      - 提供 __len__ 以兼容 pandas.Series.map(obj)
     """
     def __init__(self, db_path: str, table: str = "ecdict", word_col: str = "word", zh_col: str = "translation",
                  cache_size: int = 50000):
@@ -53,8 +54,10 @@ class SQLiteEcdict:
         # 两级缓存：值缓存（word -> str 或 None）与存在性缓存（word -> True/False）
         self._val_cache = OrderedDict()
         self._exist_cache = OrderedDict()
-        # 人工覆盖（优先于 DB 与缓存）
-        self._overrides = {}
+        # 人工覆盖（优先于 DB 与缓存）——默认含 "'s"
+        self._overrides = {"'s": "…的"}
+        # 行数缓存（供 __len__）
+        self._rowcount = None
 
         # 启动时做一次元数据探测，确保列存在（失败就抛错，和原始 CSV 缺列报错行为等价）
         try:
@@ -65,6 +68,16 @@ class SQLiteEcdict:
         need = {self.word_col.lower(), self.zh_col.lower()}
         if not need.issubset(cols):
             raise RuntimeError(f"SQLite 表缺少必须列：{self.word_col} / {self.zh_col}")
+
+    # 供 pandas 识别用（关键新增）
+    def __len__(self) -> int:
+        if self._rowcount is None:
+            try:
+                cur = self._conn.execute(f"SELECT COUNT(*) FROM {self.table}")
+                self._rowcount = int(cur.fetchone()[0])
+            except Exception:
+                self._rowcount = 0
+        return self._rowcount
 
     # LRU 基元
     def _lru_get(self, cache: OrderedDict, key):
