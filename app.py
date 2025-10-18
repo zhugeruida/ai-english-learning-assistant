@@ -533,6 +533,24 @@ def _tokenize(text: str):
 
     stitched = _pair_fix(stitched)
 
+    # ==== PATCH 1: 章节词+罗马数字黏连拆分（parti/sectionii/chapteriv 等）====
+    _CHAP_WORDS = ("part","section","chapter","figure","table","question")
+    _ROMAN_TAIL = r"(i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx)"
+    chap_pat = re.compile(rf"^({'|'.join(_CHAP_WORDS)}){_ROMAN_TAIL}$", re.IGNORECASE)
+
+    def _chapter_roman_fix(seq):
+        out = []
+        for w in seq:
+            m = chap_pat.match(w)
+            if m:
+                out.extend([m.group(1).lower(), m.group(2).lower()])
+            else:
+                out.append(w)
+        return out
+
+    stitched = _chapter_roman_fix(stitched)
+    # ==== PATCH 1 END ========================================================
+
     # 功能词“边缘救援”：保留功能词并尝试把旁边残片合回词典词
     rescued = []
     i = 0
@@ -649,10 +667,16 @@ def _tokenize(text: str):
         cut = _greedy_dict_cut(wl)
         repaired.extend(cut if cut else [wl])
 
-    # 噪声过滤
+    # ==== PATCH 2: 噪声过滤增强（选项连写 & 3字母更严格）=====================
     allow_single = {"a", "i", "v", "x"}
-    ALLOW_2 = {'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'}
-    NOISE_2 = {'ou','kf','rw','th','ei'}
+    ALLOW_2 = {
+        'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'
+    }
+    # 扩充 2 字母噪声：加入选择题常见组合（ab/bc/ba/db 等 12 个）
+    NOISE_2 = {
+        'ou','kf','rw','th','ei',
+        'ab','ac','ad','ba','bc','bd','ca','cb','cd','da','db','dc'
+    }
     # 注意：去掉 'ora'，避免误删 or a；保留 'eof' 用于上面的专项修复
     NOISE_3 = {'mor','ses','phr','eof'}
     NOISE_4 = {'toge','rang','gfrom'}
@@ -666,6 +690,7 @@ def _tokenize(text: str):
             if w in allow_single:
                 filtered.append(w)
             continue
+
         if len(w) == 2:
             if w in NOISE_2:
                 continue
@@ -673,24 +698,32 @@ def _tokenize(text: str):
                 continue
             filtered.append(w)
             continue
+
         if len(w) == 3:
             if w in NOISE_3:
                 continue
             if (w not in _ec_dict) and (w not in _FUNC_WORDS):
-                if _is_consonant_only(w):
+                # 3字母：除“全辅音”外，再加两个门槛：元音数≤1 或 字符种类≤2 视为噪声
+                vowels = len(re.findall(r"[aeiou]", w))
+                uniq = len(set(w))
+                if _is_consonant_only(w) or vowels <= 1 or uniq <= 2:
                     continue
             filtered.append(w)
             continue
+
         if len(w) == 4:
             if w in NOISE_4:
                 continue
+
         # 4–5 字母：非词典且非功能词，且“全辅音或元音计数<=1 或字符种类<=2” → 噪声
         if 4 <= len(w) <= 5 and (w not in _ec_dict) and (w not in _FUNC_WORDS):
             vowels = len(re.findall(r"[aeiou]", w))
             uniq = len(set(w))
             if _is_consonant_only(w) or vowels <= 1 or uniq <= 2:
                 continue
+
         filtered.append(w)
+    # ==== PATCH 2 END ========================================================
 
     return filtered
 
