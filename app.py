@@ -1,4 +1,4 @@
-# app.py — only tokenizer & tiny rescue enhanced; UI/routes/export unchanged
+# app.py — tokenizer rescue + SQLite NOCASE; UI/routes/export unchanged
 
 from urllib.parse import quote  # 用于 Content-Disposition 的 UTF-8 文件名
 from fastapi import FastAPI, Request, UploadFile, File, Query
@@ -12,11 +12,11 @@ import re
 import unicodedata
 import pandas as pd
 from collections import Counter
-import time   # 日志查看哪一步耗时
-import tempfile  # DOCX 临时文件更稳健
-import uuid      # 并发隔离：会话 ID
+import time
+import tempfile
+import uuid
 
-# ========= SQLite + LRU 词典（保留上一版，未改接口）=========
+# ========= SQLite + LRU 词典 =========
 import sqlite3
 import threading
 from collections import OrderedDict
@@ -42,12 +42,12 @@ class SQLiteEcdict:
         self._overrides = {"'s": "…的"}
         self._rowcount = None
 
+        # 列探测
         try:
             cur = self._conn.execute(f"PRAGMA table_info({self.table})")
             cols = {row["name"].lower() for row in cur.fetchall()}
         except Exception as e:
             raise RuntimeError(f"无法读取 SQLite 元数据：{e}")
-
         if self.word_col.lower() not in cols:
             raise RuntimeError(f"SQLite 表缺少必须列：{self.word_col}")
 
@@ -64,12 +64,8 @@ class SQLiteEcdict:
         for c in fallback_list:
             if c in cols and c not in candidates:
                 candidates.append(c)
-
         if not candidates:
-            raise RuntimeError(
-                "未找到可用的中文释义列。请提供包含 translation/cn/definition 等列的 ecdict 数据库，"
-                "或通过 ECDICT_ZH_COL / ECDICT_FALLBACK_COLS 指定。"
-            )
+            raise RuntimeError("未找到可用的中文释义列；可用 ECDICT_ZH_COL / ECDICT_FALLBACK_COLS 指定。")
         self._val_cols = candidates
 
     def __len__(self) -> int:
@@ -98,6 +94,7 @@ class SQLiteEcdict:
             if len(cache) > self.cache_size:
                 cache.popitem(last=False)
 
+    # 用 NOCASE，避免 LOWER(column) 造成全表扫
     def _query_db(self, key_lc: str) -> Optional[str]:
         try:
             cols_sql = ", ".join(self._val_cols)
@@ -178,7 +175,7 @@ class SQLiteEcdict:
             pass
 
 
-# ========= 优先尝试 PyPDF（保留）=========
+# ========= 优先 PyPDF，回退 pdfminer =========
 try:
     from pypdf import PdfReader
 except Exception:
@@ -244,10 +241,10 @@ def _put_session(sid: str, filename, df_freq, df_pos, page_size=500):
         except Exception:
             pass
 
-# ================== 词典配置（保持不变） ==================
+# ================== 词典配置 ==================
 DB_PATH = os.getenv("ECDICT_DB_PATH", "data/ecdict.sqlite3")
 if not os.path.exists(DB_PATH):
-    raise RuntimeError("缺少 data/ecdict.sqlite3（或设置 ECDICT_DB_PATH）。请提供包含 word/translation 列的 SQLite 数据库。")
+    raise RuntimeError("缺少 data/ecdict.sqlite3（或设置 ECDICT_DB_PATH）。")
 
 _ECDICT_CACHE_SIZE = int(os.getenv("ECDICT_CACHE_SIZE", "50000"))
 _ec_dict = SQLiteEcdict(
@@ -292,12 +289,15 @@ def _read_text_from_upload(fname: str, data: bytes) -> str:
         return ""
     if name.endswith(".docx") and docx is not None:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tf:
-            tf.write(data); tmp = tf.name
+            tf.write(data)
+            tmp = tf.name
         try:
             d = docx.Document(tmp)
         finally:
-            try: os.remove(tmp)
-            except Exception: pass
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
         return "\n".join(p.text for p in d.paragraphs)[:MAX_CHARS]
     try:
         return data.decode("utf-8", errors="ignore")[:MAX_CHARS]
@@ -309,43 +309,36 @@ _EMAIL_RE = re.compile(r"(?i)\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
 _SUFFIX_FUNCS = r"(?:from|for|the|that|this|these|those|your|our|their|and|to|of|with|without)"
 _PREFIX_FUNCS = r"(?:and|or|but|for|to|of|in|on|at|from|by|the|that|this|these|those|with|without)"
 
-UNICODE_ROMAN_MAP = {"Ⅰ":"I","Ⅱ":"II","Ⅲ":"III","Ⅳ":"IV","Ⅴ":"V","Ⅵ":"VI","Ⅶ":"VII","Ⅷ":"VIII","Ⅸ":"IX","Ⅹ":"X",
-    "Ⅺ":"XI","Ⅻ":"XII","Ⅼ":"L","Ⅽ":"C","Ⅾ":"D","Ⅿ":"M","ⅰ":"i","ⅱ":"ii","ⅲ":"iii","ⅳ":"iv","ⅴ":"v","ⅵ":"vi",
-    "ⅶ":"vii","ⅷ":"viii","ⅸ":"ix","ⅹ":"x","ⅺ":"xi","ⅻ":"xii","ⅼ":"l","ⅽ":"c","ⅾ":"d","ⅿ":"m"}
+UNICODE_ROMAN_MAP = {
+    "Ⅰ":"I","Ⅱ":"II","Ⅲ":"III","Ⅳ":"IV","Ⅴ":"V","Ⅵ":"VI","Ⅶ":"VII","Ⅷ":"VIII","Ⅸ":"IX","Ⅹ":"X",
+    "Ⅺ":"XI","Ⅻ":"XII","Ⅼ":"L","Ⅽ":"C","Ⅾ":"D","Ⅿ":"M",
+    "ⅰ":"i","ⅱ":"ii","ⅲ":"iii","ⅳ":"iv","ⅴ":"v","ⅵ":"vi","ⅶ":"vii","ⅷ":"viii","ⅸ":"ix","ⅹ":"x",
+    "ⅺ":"xi","ⅻ":"xii","ⅼ":"l","ⅽ":"c","ⅾ":"d","ⅿ":"m"
+}
 
 def _normalize_unicode_roman(s: str) -> str:
     return "".join(UNICODE_ROMAN_MAP.get(ch, ch) for ch in s)
 
-def _preclean_text(text: str) -> str:
-    text = _URL_RE.sub(" ", text)
-    text = _EMAIL_RE.sub(" ", text)
-    WATERMARK_PAT = re.compile(r"(?i)\b(zjuxz|xuezhan|zju|zjuxz\.cn)\b")
-    text = WATERMARK_PAT.sub(" ", text)
-    text = re.sub(r"([A-Za-z])[,\uFF0C]\s*([A-Za-z])", r"\1 \2", text)
-    text = re.sub(r"([A-Za-z])[.\u3002]\s*([A-Za-z])", r"\1 \2", text)
-    text = re.sub(r"([A-Za-z])[;；]\s*([A-Za-z])", r"\1 \2", text)
-    text = re.sub(r"([A-Za-z])[:：]\s*([A-Za-z])", r"\1 \2", text)
-    text = re.sub(r"([A-Za-z])、\s*([A-Za-z])", r"\1 \2", text)
-    text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
-    text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z])", r"\1 \2", text, flags=re.IGNORECASE)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text
-
-# 词性/专名/罗马数字等辅件（保持不变）
+# 词性/专名/罗马数字等辅件
 MONTHS = {"january","february","march","april","may","june","july","august","september","october","november","december"}
 WEEKDAYS = {"monday","tuesday","wednesday","thursday","friday","saturday","sunday"}
 ALWAYS_CAP = {"washington","australia","gutenberg","tom","daisy","gatsby"}
-ROMAN_MAP = {"i":1,"ii":2,"iii":3,"iv":4,"v":5,"vi":6,"vii":7,"viii":8,"ix":9,"x":10,"xi":11,"xii":12,"xiii":13,
-             "xiv":14,"xv":15,"xvi":16,"xvii":17,"xviii":18,"xix":19,"xx":20}
+ROMAN_MAP = {"i":1,"ii":2,"iii":3,"iv":4,"v":5,"vi":6,"vii":7,"viii":8,"ix":9,"x":10,"xi":11,"xii":12,"xiii":13,"xiv":14,"xv":15,"xvi":16,"xvii":17,"xviii":18,"xix":19,"xx":20}
 DETECTED_PROPER = set()
-_TITLECASE_STOP = {"the","a","an","and","but","or","nor","for","so","yet","when","where","what","who","whom","whose",
-    "why","which","while","if","in","on","at","to","of","from","with","without","into","onto","over","under","about","above",
-    "below","he","she","it","they","we","you","i","his","her","its","their","our","your","this","that","these","those",
-    "there","here","then","thus","hence","once","directions","dialogue","text","paper","okay","oh","uh","phrases",
-    "answers","choices","passage","section","part"}
-_COMMON_LOWER_STOP = {"one","two","three","four","five","six","seven","eight","nine","ten","first","second","third",
-                      "fourth","fifth","sixth","seventh","eighth","ninth","tenth","part","section","passage","dialogue",
-                      "answer","sheet","points","choice","choices","men","women","time","more","from","about","my","our","your"}
+_TITLECASE_STOP = {
+    "the","a","an","and","but","or","nor","for","so","yet",
+    "when","where","what","who","whom","whose","why","which","while",
+    "if","in","on","at","to","of","from","with","without","into","onto","over","under","about","above","below",
+    "he","she","it","they","we","you","i","his","her","its","their","our","your",
+    "this","that","these","those","there","here","then","thus","hence","once",
+    "directions","dialogue","text","paper","okay","oh","uh","phrases","answers","choices","passage","section","part"
+}
+_COMMON_LOWER_STOP = {
+    "one","two","three","four","five","six","seven","eight","nine","ten",
+    "first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth",
+    "part","section","passage","dialogue","answer","sheet","points","choice","choices",
+    "men","women","time","more","from","about","my","our","your",
+}
 _MONTHS_DAYS = set(list(MONTHS) + list(WEEKDAYS))
 _PROPER_RE = re.compile(r"\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\b")
 _WORD_LOWER_RE = re.compile(r"\b([a-z]+(?:-[a-z]+)?)\b")
@@ -363,26 +356,53 @@ def _detect_proper_nouns_from_text(raw_text: str):
                 continue
             DETECTED_PROPER.add(wl)
 
+def _preclean_text(text: str) -> str:
+    text = _URL_RE.sub(" ", text)
+    text = _EMAIL_RE.sub(" ", text)
+    WATERMARK_PAT = re.compile(r"(?i)\b(zjuxz|xuezhan|zju|zjuxz\.cn)\b")
+    text = WATERMARK_PAT.sub(" ", text)
+    text = re.sub(r"([A-Za-z])[,\uFF0C]\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])[.\u3002]\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])[;；]\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])[:：]\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])、\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(rf"([A-Za-z])({_SUFFIX_FUNCS})\b", r"\1 \2", text, flags=re.IGNORECASE)
+    text = re.sub(rf"\b({_PREFIX_FUNCS})([A-Za-z])", r"\1 \2", text, flags=re.IGNORECASE)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
     text = _normalize_unicode_roman(text)
+
+    # 行尾断词修复
     text = re.sub(r"([A-Za-z])-\s*\n\s*([A-Za-z])", r"\1\2\n", text)
     text = re.sub(r"([A-Za-z])\s*\n\s*([A-Za-z])",   r"\1 \2", text)
+
+    # 合字/下划线/连写
     text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
     text = re.sub(r"(?<=\w)[\\/](?=\w)", " ", text)
+
+    # 预清洗
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
     _CONNECTORS = ('the','that','your','our','their','his','her','my','answer','answers','phrases','demand')
     for w in _CONNECTORS:
         pat = re.compile(rf'([A-Za-z])({w})([A-Za-z])', re.IGNORECASE)
         text = pat.sub(r'\1 \2 \3', text)
+
+    # I/A 右吸附 & 罗马数字
     text = re.sub(r"\b([IA])([a-z])", r"\1 \2", text)
     text = re.sub(r"\b([A-Za-z]{2,})([IVXLCDM]{1,4})\b", r"\1 \2", text)
+
+    # 标点、栏目词黏连修补
     text = _preclean_text(text)
 
+    # 初次提取
     raw = [m.group(0).lower() for m in _WORD_RE.finditer(text)]
 
+    # 所有格拆分
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
@@ -398,6 +418,7 @@ def _tokenize(text: str):
         else:
             toks.append(w)
 
+    # 人名+'ll 的轻修
     fixed = []
     for w in toks:
         if (w.endswith("’ll") or w.endswith("'ll")) and len(w) > 3:
@@ -407,6 +428,7 @@ def _tokenize(text: str):
         fixed.append(w)
     toks = fixed
 
+    # 黏连修复（含 a/i 前缀的安全合并）
     stitched = []
     i = 0
     while i < len(toks):
@@ -423,20 +445,20 @@ def _tokenize(text: str):
                 cand3 = (w1 + w2 + w3)
                 if 2 <= len(w1) <= 10 and 1 <= len(w2) <= 10 and 1 <= len(w3) <= 10 and cand3 in _ec_dict:
                     stitched.append(cand3); i += 3; merged = True
-        if merged: 
+        if merged:
             continue
 
-        # === 修改点 A：放宽 a/i 合并（仅当合并后是真词且长度≥4）===
+        # 放宽：单字母 + 后词，若合并后命中词典（且长度≥4）则安全合并（含 a/i）
         if len(w1) == 1 and w1.isalpha() and w2:
             cand = (w1 + w2)
-            if cand in _ec_dict and len(cand) >= 4:   # 新增条件
+            if cand in _ec_dict and len(cand) >= 4:
                 stitched.append(cand); i += 2; continue
-            # 原规则：非 a/i 的前缀字母可以与后词合并（保留）
             if w1 not in {"a", "i"} and len(w2) >= 2 and w2[0].isalpha() and cand in _ec_dict:
                 stitched.append(cand); i += 2; continue
 
         stitched.append(w1); i += 1
 
+    # 邻接回拼与专项修复
     SMALL_FWS = {'to','the','from','your','our','their','his','her','my','and','or','of','in','on','for'}
 
     def _pair_fix(seq):
@@ -463,6 +485,7 @@ def _tokenize(text: str):
 
     stitched = _pair_fix(stitched)
 
+    # chapter/section + 罗马数字 拆分
     _CHAP_WORDS = ("part","section","chapter","figure","table","question")
     _ROMAN_TAIL = r"(i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx)"
     chap_pat = re.compile(rf"^({'|'.join(_CHAP_WORDS)}){_ROMAN_TAIL}$", re.IGNORECASE)
@@ -475,23 +498,22 @@ def _tokenize(text: str):
         return out
     stitched = _chapter_roman_fix(stitched)
 
-    # === 新增点 B：缺首/缺尾 1 字母的轻量修复（仅对“非词典词 & 长度4-10 & 纯字母”）===
+    # 缺首/缺尾 1 字母的轻救援
     HOT_PREFIX = ('a','u','t','s','c','e','h','o','r','p','m','b','d','g','l','n','f','i')
     HEAD_MISS_MAP = {
-        "nyone":"anyone","fter":"after","ntil":"until","mong":"among","ecause":"because",
+        "nyone":"anyone","nything":"anything","nywhere":"anywhere","nother":"another",
+        "fter":"after","ntil":"until","mong":"among","ecause":"because",
         "etween":"between","hese":"these","hose":"those","here":"there","hich":"which",
-        "ver":"over","eople":"people","nstead":"instead","gain":"again","nother":"another"
+        "ver":"over","eople":"people","nstead":"instead","gain":"again"
     }
     def _rescue_head_tail(seq):
         out = []
-        for idx, w in enumerate(seq):
-            wl = w.lower()
+        for w in seq:
+            wl = str(w).lower()
             if wl.isalpha() and 4 <= len(wl) <= 10 and wl not in _ec_dict:
-                # 1) 小白名单直接映射（需在词典中确认）
                 direct = HEAD_MISS_MAP.get(wl)
                 if direct and direct in _ec_dict:
                     out.append(direct); continue
-                # 2) 尝试补 1 个“热前缀”字母
                 fixed = None
                 for ch in HOT_PREFIX:
                     cand = ch + wl
@@ -499,7 +521,6 @@ def _tokenize(text: str):
                         fixed = cand; break
                 if fixed:
                     out.append(fixed); continue
-                # 3) 偶发缺尾（g/e）—很克制
                 for ch in ("g","e"):
                     cand2 = wl + ch
                     if cand2 in _ec_dict:
@@ -510,9 +531,8 @@ def _tokenize(text: str):
                 out.append(wl)
         return out
     stitched = _rescue_head_tail(stitched)
-    # === 新增点 B 结束 ===
 
-    # —— 继续后续修复（保持原样）——
+    # 功能词“边缘救援”与贪心切分（保持原逻辑）
     rescued = []
     i = 0
     while i < len(stitched):
@@ -599,6 +619,7 @@ def _tokenize(text: str):
         cut = _greedy_dict_cut(wl)
         repaired.extend(cut if cut else [wl])
 
+    # 噪声过滤（保持原阈值）
     allow_single = {"a", "i", "v", "x"}
     ALLOW_2 = {'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'}
     NOISE_2 = {'ou','kf','rw','th','ei','ab','ac','ad','ba','bc','bd','ca','cb','cd','da','db','dc'}
@@ -615,7 +636,7 @@ def _tokenize(text: str):
                 filtered.append(w)
             continue
         if len(w) == 2:
-            if w in NOISE_2: 
+            if w in NOISE_2:
                 continue
             if (w not in _ec_dict) and (w not in ALLOW_2) and (w not in _FUNC_WORDS):
                 continue
@@ -637,7 +658,7 @@ def _tokenize(text: str):
         filtered.append(w)
     return filtered
 
-# ---------- 显示与释义清洗（保持不变） ----------
+# ---------- 显示与释义清洗 ----------
 _POS_TAGS = ["n","vi","vt","v","adj","a","adv","art","pron","prep","conj","int","num","aux","abbr","pref","suff"]
 
 def _normalize_pos_display(line: str) -> str:
@@ -684,7 +705,7 @@ MANUAL_CONTRACTIONS = {
     "they've": "contr. 他们已/他们有（= they have）", "they’ve": "contr. 他们已/他们有（= they have）",
     "they'll": "contr. 他们将/他们会（= they will / they shall）", "they’ll": "contr. 他们将/他们会（= they will / they shall）",
     "he's": "contr. 他是/他有（= he is / he has）", "he’s": "contr. 他是/他有（= he is / he has）",
-    "he'd": "contr. 他愿意/他已经/他应该（= he would / he had / he should）", "he’d": "contr. 他愿意/他已经/他应该（= he would / he had / he should）",
+    "he'd": "contr. 他愿意/他已经/他应该（= he would / he had / he should）", "he’d": "contr. 他愿意/他已经/他应该（= he would / he should / he had）",
     "he'll": "contr. 他将/他会（= he will / he shall）", "he’ll": "contr. 他将/他会（= he will / he shall）",
     "she's": "contr. 她是/她有（= she is / she has）", "she’s": "contr. 她是/她有（= she is / she has）",
     "she'd": "contr. 她愿意/她已经/她应该（= she would / she had / she should）", "she’d": "contr. 她愿意/她已经/她应该（= she would / she had / she should）",
@@ -808,6 +829,7 @@ def _build_dataframe(tokens):
     df_pos  = df.sort_values(["pos"]).reset_index(drop=True)
     return df_freq, df_pos
 
+# ---------- 页面 ----------
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
@@ -831,9 +853,11 @@ async def upload(request: Request, file: UploadFile = File(...)):
             raise ValueError("未解析到有效英文单词")
         df_freq, df_pos = _build_dataframe(tokens)
         t4 = time.perf_counter()
+
         sid = _get_sid_from_request(request) or _ensure_session()
         _put_session(sid, file.filename, df_freq, df_pos, page_size=STATE.get("page_size", 500))
         STATE["filename"] = file.filename; STATE["df_freq"] = df_freq; STATE["df_pos"] = df_pos
+
         resp = RedirectResponse(url="/result?sort=freq&page=1", status_code=303)
         resp.set_cookie("sid", sid, httponly=True, samesite="lax")
         return resp
@@ -863,10 +887,14 @@ def result(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$"), 
         return RedirectResponse("/", status_code=303)
     df = df_freq if sort == "freq" else df_pos
     sub, cur, pages, total = _slice_page(df, page, page_size)
-    return templates.TemplateResponse("result.html", {"request": request, "filename": filename,
-        "rows": sub.to_dict(orient="records"), "page": cur, "pages": pages, "total": total,
-        "page_size": page_size, "sort": sort})
+    return templates.TemplateResponse(
+        "result.html",
+        {"request": request, "filename": filename,
+         "rows": sub.to_dict(orient="records"), "page": cur, "pages": pages, "total": total,
+         "page_size": page_size, "sort": sort}
+    )
 
+# ---------- 导出 ----------
 @app.get("/export")
 def export(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$")):
     sess = _get_session_state(request)
@@ -909,4 +937,4 @@ def healthz():
 
 @app.head("/healthz")
 def healthz_head():
-    return PlainTextResponse("", status_code=200)
+    return PlainTextResponse("", status_code=200) 
