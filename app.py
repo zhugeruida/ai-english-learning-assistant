@@ -34,6 +34,7 @@ class SQLiteEcdict:
       - LRU 缓存命中后不访问 DB
       - 线程安全（单连接 + 全局锁；或使用 sqlite 内部并发）
       - 提供 __len__ 以兼容 pandas.Series.map(obj)
+      - 查询使用多列级联：translation -> definition -> collins
     """
     def __init__(self, db_path: str, table: str = "ecdict", word_col: str = "word", zh_col: str = "translation",
                  cache_size: int = 50000):
@@ -69,6 +70,14 @@ class SQLiteEcdict:
         if not need.issubset(cols):
             raise RuntimeError(f"SQLite 表缺少必须列：{self.word_col} / {self.zh_col}")
 
+        # 允许的备用列（存在才参与 COALESCE）
+        self._fallback_cols = [c for c in ("definition", "collins") if c in cols]
+        self._val_expr = "COALESCE(" + ", ".join(
+            [f"NULLIF(TRIM({self.zh_col}), '')"] +
+            [f"NULLIF(TRIM({c}), '')" for c in self._fallback_cols] +
+            ["''"]
+        ) + ")"
+
     # 供 pandas 识别用（关键新增）
     def __len__(self) -> int:
         if self._rowcount is None:
@@ -97,18 +106,17 @@ class SQLiteEcdict:
             if len(cache) > self.cache_size:
                 cache.popitem(last=False)
 
-    # 查询 DB
+    # 查询 DB（使用 COALESCE：translation -> definition -> collins）
     def _query_db(self, key_lc: str) -> Optional[str]:
         try:
             cur = self._conn.execute(
-                f"SELECT {self.zh_col} FROM {self.table} WHERE LOWER({self.word_col}) = ? LIMIT 1",
+                f"SELECT {self._val_expr} AS v FROM {self.table} WHERE LOWER({self.word_col}) = ? LIMIT 1",
                 (key_lc,)
             )
             row = cur.fetchone()
             if row is None:
                 return None
-            zh = row[0] if isinstance(row, sqlite3.Row) else row[0]
-            zh = (zh or "").strip()
+            zh = (row[0] or "").strip()
             return zh if zh else ""
         except Exception:
             # 查询异常视为未命中（与原来缺词等价）
@@ -231,7 +239,7 @@ STATE = {
     "filename": None,
     "df_freq": None,
     "df_pos": None,
-    "page_size": 500,
+            "page_size": 500,
 }
 SESSIONS = {}  # type: dict[str, dict]
 
@@ -275,6 +283,68 @@ _ec_dict = SQLiteEcdict(DB_PATH, table=os.getenv("ECDICT_TABLE", "ecdict"),
 
 # 给 possessive "'s" 固定翻译（保持与原行为一致；仅内存覆盖，不写 DB）
 _ec_dict["'s"] = "…的"
+
+# 高频功能词内置覆盖（避免“保留原词：…（暂缺词典释义）”）
+FUNCTION_WORDS_ZH = {
+    "the":"art. （定冠词）这；那；该",
+    "a":"art. （不定冠词）一；每一",
+    "an":"art. （不定冠词，元音前）一",
+    "to":"prep. 向；到；对于；（不定式符号）",
+    "and":"conj. 和；并且",
+    "of":"prep. ……的；属于；含有",
+    "in":"prep. 在……里面；在……期间",
+    "on":"prep. 在……上；关于",
+    "or":"conj. 或者；否则",
+    "for":"prep. 为了；对于；达（时间）",
+    "from":"prep. 从；来自；由于",
+    "with":"prep. 和；用；具有",
+    "without":"prep. 没有；不",
+    "by":"prep. 通过；被；在……旁",
+    "as":"conj./prep. 作为；因为；如同",
+    "at":"prep. 在；以；朝向",
+    "than":"conj. 比；而不是",
+    "into":"prep. 进入；变成",
+    "onto":"prep. 到……之上",
+    "over":"prep. 在……之上；超过",
+    "under":"prep. 在……之下；小于",
+    "about":"prep. 关于；大约",
+    "above":"prep. 在……上方；超过",
+    "below":"prep. 在……下方；低于",
+    "because":"conj. 因为",
+    "before":"prep./conj. 在……之前",
+    "after":"prep./conj. 在……之后",
+    "between":"prep. 在……之间",
+    "within":"prep. 在……之内",
+    "during":"prep. 在……期间",
+    "until":"prep./conj. 直到",
+    "since":"prep./conj. 自从；因为",
+    "against":"prep. 反对；靠；对着",
+    "among":"prep. 在……之中",
+    "per":"prep. 每；按照",
+    "via":"prep. 通过；经由",
+    "be":"v. 是；存在；成为",
+    "is":"v. be 的第三人称单数现在时",
+    "are":"v. be 的复数现在时",
+    "was":"v. be 的单数过去式",
+    "were":"v. be 的复数过去式",
+    "been":"v. be 的过去分词",
+    "being":"n./v. 存在；正在……",
+    "do":"v. 做；助动词",
+    "does":"v. do 的第三人称单数现在时；助动词",
+    "did":"v. do 的过去式；助动词",
+    "not":"adv. 不；没有",
+    "no":"det./adv. 没有；不；无一个",
+    "here":"adv. 这里",
+    "there":"adv. 那里；（存在句）there is/are",
+    "so":"adv./conj. 如此；所以",
+    "such":"det./pron. 这样的；如此的",
+    "other":"adj./pron. 其他的",
+    "another":"det./pron. 另一个；再一个"
+}
+try:
+    _ec_dict._overrides.update(FUNCTION_WORDS_ZH)
+except Exception:
+    pass
 
 # ---------- 分词 ----------
 _WORD_RE = re.compile(
@@ -667,7 +737,7 @@ def _tokenize(text: str):
         cut = _greedy_dict_cut(wl)
         repaired.extend(cut if cut else [wl])
 
-    # ==== PATCH 2: 噪声过滤增强（选项连写 & 3字母更严格）=====================
+    # ==== 噪声过滤增强（选项连写 & 3字母更严格）=====================
     allow_single = {"a", "i", "v", "x"}
     ALLOW_2 = {
         'am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','on','or','so','to','up','us','we'
@@ -723,7 +793,7 @@ def _tokenize(text: str):
                 continue
 
         filtered.append(w)
-    # ==== PATCH 2 END ========================================================
+    # ==== 噪声过滤 END ========================================================
 
     return filtered
 
@@ -1205,8 +1275,6 @@ def export(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$")):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers
     )
-
-
 
 @app.get("/healthz")
 def healthz():
