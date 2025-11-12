@@ -917,6 +917,7 @@ def export(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$")):
 def healthz():
     return {"status": "ok"}
 
+
 @app.head("/healthz")
 def healthz_head():
     return PlainTextResponse("", status_code=200)
