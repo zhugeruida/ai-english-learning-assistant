@@ -1042,7 +1042,7 @@ def result(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$"), 
             "<title>Processing…</title>"
             "<div style='font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto;'>"
             "正在处理文件，请稍等…（页面将自动刷新）</div>"
-            "<script>setTimeout(function(){location.reload()},1500)</script>"
+            "<script>/* disabled */ void 0</script>"
         )
 
     df = df_freq if sort == "freq" else df_pos
