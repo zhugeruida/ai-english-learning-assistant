@@ -9,4 +9,5 @@ requests
 python-dotenv
 pdfminer.six
 pypdf>=4.0.0
-gunicornxlsxwriter==3.2.9
+gunicorn
+xlsxwriter==3.2.9
