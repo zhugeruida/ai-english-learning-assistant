@@ -186,7 +186,7 @@ class FriendCsvDict:
         self.word_col_candidates = tuple(c.lower() for c in word_col_candidates)
         self.zh_col_candidates = tuple(c.lower() for c in zh_col_candidates)
         self._map = {}
-               self._ready = False
+        self._ready = False
         self._lock = threading.RLock()
         self._overrides = {}
         self.cache_size = max(1024, int(cache_size))
