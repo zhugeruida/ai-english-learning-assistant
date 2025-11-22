@@ -8,6 +8,5 @@ pandas
 requests
 python-dotenv
 pdfminer.six
-xlsxwriter
 pypdf>=4.0.0
-gunicorn
+gunicornxlsxwriter==3.2.9
