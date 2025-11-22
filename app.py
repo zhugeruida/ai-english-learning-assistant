@@ -973,6 +973,10 @@ def upload_get_redirect():
 def root_head():
     return PlainTextResponse("", status_code=200)
 
+@app.head("/upload")
+def upload_head():
+    return PlainTextResponse("", status_code=200)
+
 @app.post("/upload")
 async def upload(request: Request, file: UploadFile = File(...)):
     try:
@@ -1069,16 +1073,3 @@ def healthz():
 def healthz_head():
     return PlainTextResponse("", status_code=200)
 
-# --- minimal hotfix: add safe GET routes for page render (no UI change) ---
-from fastapi import Request
-from fastapi.responses import HTMLResponse
-
-@app.get("/", response_class=HTMLResponse)
-def index_page(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-@app.get("/upload", response_class=HTMLResponse)
-def upload_get(request: Request):
-    # Keep POST /upload for file submit; GET renders the same page to avoid 405 white-screen
-    return templates.TemplateResponse("index.html", {"request": request})
-# --- end hotfix ---
