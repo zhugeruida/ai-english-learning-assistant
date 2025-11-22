@@ -1041,7 +1041,7 @@ def result(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$"), 
             "<!doctype html><meta charset='utf-8'>"
             "<title>Processing…</title>"
             "<div style='font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto;'>"
-            "正在处理文件，请稍等…（页面将自动刷新）</div>"
+            "正在处理文件，请稍等…（请手动刷新或稍后打开结果页）</div>"
             "<script>/* disabled */ void 0</script>"
         )
 
