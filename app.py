@@ -840,7 +840,7 @@ MANUAL_CONTRACTIONS = {
     "he'd": "contr. 他愿意/他已经/他应该（= he would / he had / he should）", "he’d": "contr. 他愿意/他已经/他应该（= he would / he had / he should）",
     "he'll": "contr. 他将/他会（= he will / he shall）", "he’ll": "contr. 他将/他会（= he will / he shall）",
     "she's": "contr. 她是/她有（= she is / she has）", "she’s": "contr. 她是/她有（= she is / she has）",
-    "she'd": "contr. 她愿意/她已经/她应该（= she would / she had / she should）", "she’d": "contr. 她愿意/她已经/她应该（= she would / she had / she should）",
+    "she'd": "contr. 她愿意/她已经/她应该（= she would / she had / she should）", "she’d": "contr. 她愿意/她已经/她应该（= she would / she should）",
     "she'll": "contr. 她将/她会（= she will / she shall）", "she’ll": "contr. 她将/她会（= she will / she shall）",
     "it's": "contr. 它是/它有（= it is / it has）", "it’s": "contr. 它是/它有（= it is / it has）",
     "it'll": "contr. 它将/它会（= it will）", "it’ll": "contr. 它将/它会（= it will）",
@@ -961,9 +961,12 @@ def _build_dataframe(tokens):
     df_pos  = df.sort_values(["pos"]).reset_index(drop=True)
     return df_freq, df_pos
 
+# A) 首页加 no-store 防缓存（关键改动）
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    resp = templates.TemplateResponse("index.html", {"request": request})
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 @app.get("/upload")
 def upload_get_redirect():
@@ -1073,3 +1076,7 @@ def healthz():
 def healthz_head():
     return PlainTextResponse("", status_code=200)
 
+# B) 避免浏览器反复请求 favicon 404（小清理）
+@app.get("/favicon.ico")
+def favicon():
+    return PlainTextResponse("", status_code=204)
