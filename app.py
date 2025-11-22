@@ -1,6 +1,4 @@
-# app.py — integrate friend CSV dict (priority), keep everything else unchanged
-
-from urllib.parse import quote  # 用于 Content-Disposition 的 UTF-8 文件名
+from urllib.parse import quote
 from fastapi import FastAPI, Request, UploadFile, File, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,15 +9,15 @@ import os
 import re
 import unicodedata
 import pandas as pd
-from collections import Counter
+from collections import Counter, OrderedDict
 import time
 import tempfile
 import uuid
 
-# ========= SQLite + LRU 词典（保持原样）=========
+# ========= SQLite + LRU dict backend =========
 import sqlite3
 import threading
-from collections import OrderedDict
+import csv
 from typing import Optional, Iterator
 
 class SQLiteEcdict:
@@ -178,7 +176,164 @@ class SQLiteEcdict:
             pass
 
 
-# ========= PyPDF / pdfminer / docx =========
+class FriendCsvDict:
+    def __init__(self, csv_path: str,
+                 word_col_candidates=("word",),
+                 zh_col_candidates=("translation", "trans", "cn", "definition"),
+                 cache_size: int = 10000):
+        self.csv_path = csv_path
+        self.word_col_candidates = tuple(c.lower() for c in word_col_candidates)
+        self.zh_col_candidates = tuple(c.lower() for c in zh_col_candidates)
+        self._map = {}
+        self._ready = False
+        self._lock = threading.RLock()
+        self._overrides = {}
+        self.cache_size = max(1024, int(cache_size))
+        self._exist_cache = OrderedDict()
+        self._val_cache = OrderedDict()
+        t = threading.Thread(target=self._load_bg, name="friend-csv-load", daemon=True)
+        t.start()
+
+    def _load_bg(self):
+        try:
+            with open(self.csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, [])
+                cols = [h.strip().lower() for h in header]
+                try:
+                    w_idx = next(i for i, c in enumerate(cols) if c in self.word_col_candidates)
+                except StopIteration:
+                    return
+                zh_idx = None
+                for i, c in enumerate(cols):
+                    if c in self.zh_col_candidates:
+                        zh_idx = i; break
+                if zh_idx is None:
+                    return
+                local = {}
+                for row in reader:
+                    try:
+                        w = (row[w_idx] or "").strip()
+                        if not w:
+                            continue
+                        z = (row[zh_idx] or "").strip()
+                        if not z:
+                            continue
+                        local[w.lower()] = z
+                    except Exception:
+                        continue
+                with self._lock:
+                    self._map = local
+                    self._ready = True
+        except Exception:
+            self._ready = False
+
+    def _lru_get(self, cache: OrderedDict, key):
+        try:
+            with self._lock:
+                val = cache.pop(key)
+                cache[key] = val
+                return val
+        except KeyError:
+            return None
+
+    def _lru_set(self, cache: OrderedDict, key, val):
+        with self._lock:
+            if key in cache:
+                cache.pop(key)
+            cache[key] = val
+            if len(cache) > self.cache_size:
+                cache.popitem(last=False)
+
+    def get(self, key: str, default: str = "") -> str:
+        if not key:
+            return default
+        k = key.strip().lower()
+        if k in self._overrides:
+            return self._overrides[k]
+        cached = self._lru_get(self._val_cache, k)
+        if cached is not None:
+            return cached if cached != "__NONE__" else default
+        if not self._ready:
+            self._lru_set(self._val_cache, k, "__NONE__")
+            self._lru_set(self._exist_cache, k, False)
+            return default
+        with self._lock:
+            v = self._map.get(k)
+        if v is None:
+            self._lru_set(self._val_cache, k, "__NONE__")
+            self._lru_set(self._exist_cache, k, False)
+            return default
+        self._lru_set(self._val_cache, k, v)
+        self._lru_set(self._exist_cache, k, True)
+        return v
+
+    def __contains__(self, key: str) -> bool:
+        if not key:
+            return False
+        k = key.strip().lower()
+        if k in self._overrides:
+            return True
+        cached = self._lru_get(self._exist_cache, k)
+        if cached is not None:
+            return bool(cached)
+        _ = self.get(k, "")
+        cached2 = self._lru_get(self._exist_cache, k)
+        return bool(cached2)
+
+    def __getitem__(self, key: str) -> str:
+        v = self.get(key, None)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key: str, value: str):
+        with self._lock:
+            self._overrides[(key or "").strip().lower()] = value
+
+
+class CombinedDict:
+    def __init__(self, friend: Optional[FriendCsvDict], sqlite_dict: SQLiteEcdict):
+        self.friend = friend
+        self.sqlite = sqlite_dict
+        self._overrides = {}
+
+    def get(self, key: str, default: str = "") -> str:
+        k = (key or "").strip().lower()
+        if k in self._overrides:
+            return self._overrides[k]
+        if self.friend:
+            v = self.friend.get(k, None)
+            if v:
+                return v
+        v2 = self.sqlite.get(k, default)
+        return v2
+
+    def __contains__(self, key: str) -> bool:
+        k = (key or "").strip().lower()
+        if k in self._overrides:
+            return True
+        if self.friend and (k in self.friend):
+            return True
+        return k in self.sqlite
+
+    def __getitem__(self, key: str) -> str:
+        v = self.get(key, None)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key: str, value: str):
+        k = (key or "").strip().lower()
+        self._overrides[k] = value
+
+    def keys(self):
+        return iter(())
+
+    def items(self):
+        return iter(())
+
+
 try:
     from pypdf import PdfReader
 except Exception:
@@ -198,7 +353,7 @@ except Exception:
     docx = None
 
 MAX_PAGES = int(os.getenv("MAX_PAGES", "500"))
-MAX_CHARS = int(os.getenv("MAX_CHARS", "1200000"))
+MAX_CHARS = int(os.getenv("MAX_CHARS", "350000"))
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -223,16 +378,16 @@ def _debug_env():
 STATE = {"filename": None, "df_freq": None, "df_pos": None, "page_size": 500}
 SESSIONS = {}
 
-def _get_sid_from_request(request: Request) -> str | None:
+def _get_sid_from_request(request: Request):
     return request.cookies.get("sid")
 
-def _get_session_state(request: Request) -> dict | None:
+def _get_session_state(request: Request):
     sid = _get_sid_from_request(request)
     if sid and sid in SESSIONS:
         return SESSIONS[sid]
     return None
 
-def _ensure_session() -> str:
+def _ensure_session():
     return uuid.uuid4().hex
 
 def _put_session(sid: str, filename, df_freq, df_pos, page_size=500):
@@ -244,92 +399,25 @@ def _put_session(sid: str, filename, df_freq, df_pos, page_size=500):
         except Exception:
             pass
 
-# ================== 词典配置（主库不变） ==================
 DB_PATH = os.getenv("ECDICT_DB_PATH", "data/ecdict.sqlite3")
 if not os.path.exists(DB_PATH):
     raise RuntimeError("缺少 data/ecdict.sqlite3（或设置 ECDICT_DB_PATH）。请提供包含 word/translation 列的 SQLite 数据库。")
 
 _ECDICT_CACHE_SIZE = int(os.getenv("ECDICT_CACHE_SIZE", "50000"))
-_ec_dict = SQLiteEcdict(
+_sqlite_dict = SQLiteEcdict(
     DB_PATH,
     table=os.getenv("ECDICT_TABLE", "ecdict"),
     word_col=os.getenv("ECDICT_WORD_COL", "word"),
     zh_col=os.getenv("ECDICT_ZH_COL", "translation"),
     cache_size=_ECDICT_CACHE_SIZE
 )
-_ec_dict["'s"] = "…的"  # 原有覆盖不变
 
-# —— 加入“朋友 CSV 词典”，仅新增，不影响原主库 ——
-import csv
+friend_csv_path = os.getenv("FRIEND_ECDICT_CSV", "data/friend_ecdict.csv")
+_friend_dict = FriendCsvDict(friend_csv_path) if os.path.exists(friend_csv_path) else None
 
-class FriendCsvDict:
-    def __init__(self, path: str, max_rows: int = 250000):
-        self.map = {}
-        self.ok = False
-        if not os.path.exists(path):
-            return
-        try:
-            with open(path, "r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                cols = reader.fieldnames or []
-                if not cols:
-                    return
-                lc = [c.lower() for c in cols]
-                # 选择 word 列
-                if "word" in lc:
-                    word_col = cols[lc.index("word")]
-                else:
-                    word_col = cols[0]
-                # 选择翻译列
-                prefer = ["translation", "cn", "definition", "explains", "meanings"]
-                zh_col = None
-                for c in prefer:
-                    if c in lc:
-                        zh_col = cols[lc.index(c)]
-                        break
-                if zh_col is None and len(cols) >= 2:
-                    zh_col = cols[1]
-                for i, row in enumerate(reader):
-                    if max_rows and i >= max_rows:
-                        break
-                    w = (row.get(word_col, "") or "").strip().lower()
-                    z = (row.get(zh_col, "") or "").strip()
-                    if w and z and (w not in self.map):
-                        self.map[w] = z
-            self.ok = True
-            print(f"[FRIEND_DICT] loaded {len(self.map)} entries from {path}")
-        except Exception as e:
-            print(f"[FRIEND_DICT] 加载失败：{e}")
+_ec_dict = CombinedDict(_friend_dict, _sqlite_dict)
+_ec_dict["'s"] = "…的"
 
-    def get(self, key: str, default: str = "") -> str:
-        if not key:
-            return default
-        return self.map.get(key.strip().lower(), default)
-
-    def __contains__(self, key: str) -> bool:
-        if not key:
-            return False
-        return key.strip().lower() in self.map
-
-FRIEND_CSV_PATH = os.getenv("FRIEND_CSV_PATH", "data/friend_ecdict.csv")
-_friend = FriendCsvDict(FRIEND_CSV_PATH, max_rows=int(os.getenv("FRIEND_MAX_ROWS", "250000"))) if os.path.exists(FRIEND_CSV_PATH) else None
-
-def _lookup_zh_base(word_lc: str) -> str:
-    """优先朋友 CSV；缺失时回落 SQLite 主库；均无则空串"""
-    if _friend and _friend.ok:
-        z = _friend.get(word_lc, "")
-        if z:
-            return z
-    return _ec_dict.get(word_lc, "")
-
-class _LookupAdapter:
-    """为 _plural_fallback 传入 .get 接口的适配器"""
-    def get(self, key: str, default: str = "") -> str:
-        return _lookup_zh_base(key) or default
-
-_LOOKUP_ADAPTER = _LookupAdapter()
-
-# ---------- 分词 ----------
 _WORD_RE = re.compile(r"(?:[A-Za-z]+(?:['’][A-Za-z]+)?)|(?:\d+(?:[A-Za-z]+|[A-Za-z]*[\/\-][A-Za-z]+))")
 
 def _read_text_from_upload(fname: str, data: bytes) -> str:
@@ -391,8 +479,8 @@ def _preclean_text(text: str) -> str:
     text = _EMAIL_RE.sub(" ", text)
     WATERMARK_PAT = re.compile(r"(?i)\b(zjuxz|xuezhan|zju|zjuxz\.cn)\b")
     text = WATERMARK_PAT.sub(" ", text)
-    text = re.sub(r"([A-Za-z])[,\uFF0C]\s*([A-Za-z])", r"\1 \2", text)
-    text = re.sub(r"([A-Za-z])[.\u3002]\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])[,，]\s*([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])[.。]\s*([A-Za-z])", r"\1 \2", text)
     text = re.sub(r"([A-Za-z])[;；]\s*([A-Za-z])", r"\1 \2", text)
     text = re.sub(r"([A-Za-z])[:：]\s*([A-Za-z])", r"\1 \2", text)
     text = re.sub(r"([A-Za-z])、\s*([A-Za-z])", r"\1 \2", text)
@@ -401,7 +489,6 @@ def _preclean_text(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
-# 词性/专名/罗马数字等辅件（保持原样）
 MONTHS = {"january","february","march","april","may","june","july","august","september","october","november","december"}
 WEEKDAYS = {"monday","tuesday","wednesday","thursday","friday","saturday","sunday"}
 ALWAYS_CAP = {"washington","australia","gutenberg","tom","daisy","gatsby"}
@@ -421,17 +508,28 @@ _PROPER_RE = re.compile(r"\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\b")
 _WORD_LOWER_RE = re.compile(r"\b([a-z]+(?:-[a-z]+)?)\b")
 
 def _detect_proper_nouns_from_text(raw_text: str):
+    sample = (raw_text or "")[: int(MAX_CHARS * 0.6)]
     DETECTED_PROPER.clear()
     cap_cnt = Counter(); low_cnt = Counter()
-    for m in _PROPER_RE.finditer(raw_text):
+    for m in _PROPER_RE.finditer(sample):
         wl = m.group(1).lower(); cap_cnt[wl] += 1
-    for m in _WORD_LOWER_RE.finditer(raw_text):
+    for m in _WORD_LOWER_RE.finditer(sample):
         wl = m.group(1).lower(); low_cnt[wl] += 1
     for wl, c in cap_cnt.items():
         if c >= 2 and low_cnt.get(wl, 0) == 0:
             if wl in _TITLECASE_STOP or wl in _COMMON_LOWER_STOP or wl in _MONTHS_DAYS or wl == "i":
                 continue
             DETECTED_PROPER.add(wl)
+
+_FUNC_WORDS = {'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
+    'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about','above','below',
+    'because','before','after','between','within','during','until','since','against','among','per','via','are','is',
+    'be','been','being','was','were','not','no','do','does','did','will','would','can','could','should','may','might',
+    'must','if','then','so','such','other','another','each','every','some','any','more','most','many','much','few',
+    'several','both','either','neither','own','same','too','very','just','even','also','less','least','again',
+    'further','up','down','out','off','here','there','where','when','why','how','one','two','three','four','five',
+    'six','seven','eight','nine','ten'}
+_SPLIT_PATS = tuple(re.compile(rf'([a-z]{{2,}})({re.escape(fw)})([a-z]{{2,}})', re.IGNORECASE) for fw in _FUNC_WORDS)
 
 def _tokenize(text: str):
     text = unicodedata.normalize("NFKC", text)
@@ -440,7 +538,7 @@ def _tokenize(text: str):
     text = re.sub(r"([A-Za-z])\s*\n\s*([A-Za-z])",   r"\1 \2", text)
     text = (text.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬃ", "ffi").replace("ﬄ", "ffl"))
     text = re.sub(r"_{2,}|[_]{1,}\d+|\b\d+_{1,}\b", " ", text)
-    text = re.sub(r"(?<=\w)[\\/](?=\w)", " ", text)
+    text = re.sub(r"(?<=\w)[\/](?=\w)", " ", text)
     text = re.sub(r'https?://\S+|www\.\S+', ' ', text)
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
     _CONNECTORS = ('the','that','your','our','their','his','her','my','answer','answers','phrases','demand')
@@ -456,11 +554,11 @@ def _tokenize(text: str):
     toks = []
     for w in raw:
         if (w.endswith("'s") or w.endswith("’s")) and len(w) > 2:
-            base = w[:-2]; 
+            base = w[:-2];
             if base: toks.append(base)
             toks.append("'s")
         elif (w.endswith("s’") or w.endswith("s'")) and len(w) > 2:
-            base = w[:-2]; 
+            base = w[:-2];
             if base: toks.append(base)
             toks.append("'s")
         elif w in {"’s", "'s"}:
@@ -493,7 +591,7 @@ def _tokenize(text: str):
                 cand3 = (w1 + w2 + w3)
                 if 2 <= len(w1) <= 10 and 1 <= len(w2) <= 10 and 1 <= len(w3) <= 10 and cand3 in _ec_dict:
                     stitched.append(cand3); i += 3; merged = True
-        if merged: 
+        if merged:
             continue
 
         if len(w1) == 1 and w1.isalpha() and w2:
@@ -543,7 +641,42 @@ def _tokenize(text: str):
         return out
     stitched = _chapter_roman_fix(stitched)
 
-    # —— 其余修复保持不变（省略注释，只保留原逻辑） ——
+    HOT_PREFIX = ('a','u','t','s','c','e','h','o','r','p','m','b','d','g','l','n','f','i')
+    HEAD_MISS_MAP = {
+        "nyone":"anyone","fter":"after","ntil":"until","mong":"among","ecause":"because",
+        "etween":"between","hese":"these","hose":"those","here":"there","hich":"which",
+        "ver":"over","eople":"people","nstead":"instead","gain":"again","nother":"another",
+        "niversity":"university","ction":"section","uestion":"question","rogram":"program",
+        "eview":"review","nternet":"internet","telge":"college"
+    }
+    TAIL_TRY = ("e","y","d","t","n","r","l","g")
+
+    def _rescue_head_tail(seq):
+        out = []
+        for idx, w in enumerate(seq):
+            wl = w.lower()
+            if wl.isalpha() and 4 <= len(wl) <= 10 and wl not in _ec_dict:
+                direct = HEAD_MISS_MAP.get(wl)
+                if direct and direct in _ec_dict:
+                    out.append(direct); continue
+                fixed = None
+                for ch in HOT_PREFIX:
+                    cand = ch + wl
+                    if cand in _ec_dict:
+                        fixed = cand; break
+                if fixed:
+                    out.append(fixed); continue
+                for ch in TAIL_TRY:
+                    cand2 = wl + ch
+                    if cand2 in _ec_dict:
+                        out.append(cand2); break
+                else:
+                    out.append(wl)
+            else:
+                out.append(wl)
+        return out
+    stitched = _rescue_head_tail(stitched)
+
     rescued = []
     i = 0
     while i < len(stitched):
@@ -573,21 +706,11 @@ def _tokenize(text: str):
         rescued.append(t); i += 1
     stitched = rescued
 
-    _FUNC_WORDS = {'to','of','on','in','for','from','with','without','and','or','but','that','this','these','those',
-        'your','our','their','his','her','my','by','as','at','than','into','onto','over','under','about','above','below',
-        'because','before','after','between','within','during','until','since','against','among','per','via','are','is',
-        'be','been','being','was','were','not','no','do','does','did','will','would','can','could','should','may','might',
-        'must','if','then','so','such','other','another','each','every','some','any','more','most','many','much','few',
-        'several','both','either','neither','own','same','too','very','just','even','also','less','least','again',
-        'further','up','down','out','off','here','there','where','when','why','how','one','two','three','four','five',
-        'six','seven','eight','nine','ten'}
-
     def _split_by_func_words(s: str) -> str:
         changed = True
         while changed:
             changed = False
-            pat_list = [re.compile(rf'([a-z]{{2,}})({fw})([a-z]{{2,}})', re.IGNORECASE) for fw in _FUNC_WORDS]
-            for pat in pat_list:
+            for pat in _SPLIT_PATS:
                 new_s, n = pat.subn(r'\1 \2 \3', s)
                 if n > 0:
                     s = new_s; changed = True
@@ -646,7 +769,7 @@ def _tokenize(text: str):
                 filtered.append(w)
             continue
         if len(w) == 2:
-            if w in NOISE_2: 
+            if w in NOISE_2:
                 continue
             if (w not in _ec_dict) and (w not in ALLOW_2) and (w not in _FUNC_WORDS):
                 continue
@@ -668,7 +791,6 @@ def _tokenize(text: str):
         filtered.append(w)
     return filtered
 
-# ---------- 显示与释义清洗（仅把查词入口改为朋友优先） ----------
 _POS_TAGS = ["n","vi","vt","v","adj","a","adv","art","pron","prep","conj","int","num","aux","abbr","pref","suff"]
 
 def _normalize_pos_display(line: str) -> str:
@@ -676,7 +798,7 @@ def _normalize_pos_display(line: str) -> str:
 
 def _format_zh(zh: str) -> str:
     if not zh: return ""
-    s = zh.replace("\\n", "\n").replace("\r", "\n").replace("\\r", "")
+    s = zh.replace("\\n", "\n").replace("\\r", "\n").replace("\\\\r", "")
     s = re.sub(r"\n+", "\n", s)
     t = re.sub(r"\s*((?:" + "|".join(_POS_TAGS) + r")\.)", r"\n\1", s)
     lines = [ln.strip() for ln in t.split("\n")]
@@ -773,7 +895,7 @@ def _fallback_guess(word: str, cur_zh: str) -> str:
         parts = [p for p in word.split("-") if p]
         zh_parts = []
         for p in parts:
-            base = _lookup_zh_base(p.lower())  # 改：朋友优先
+            base = _ec_dict.get(p.lower(), "")
             if not base:
                 if p[:1].isupper(): zh_parts.append("专有名词")
                 elif _ABBR_RE.match(p): zh_parts.append("缩写")
@@ -783,7 +905,7 @@ def _fallback_guess(word: str, cur_zh: str) -> str:
                     for suf, rep in _SUFFIXES:
                         if p.lower().endswith(suf) and len(p) > len(suf)+1:
                             stem = (p[:-len(suf)] + rep).lower()
-                            base2 = _lookup_zh_base(stem)  # 改：朋友优先
+                            base2 = _ec_dict.get(stem, "")
                             if base2:
                                 zh_parts.append(_format_zh(base2) + "（派生）"); done = True; break
                     if not done: zh_parts.append(p)
@@ -793,9 +915,9 @@ def _fallback_guess(word: str, cur_zh: str) -> str:
     for suf, rep in _SUFFIXES:
         if wl.endswith(suf) and len(wl) > len(suf)+1:
             stem = wl[:-len(suf)] + rep
-            base = _lookup_zh_base(stem)  # 改：朋友优先
+            base = _ec_dict.get(stem, "")
             if base: return _format_zh(base) + "（派生）"
-    plural_try = _plural_fallback(wl, _LOOKUP_ADAPTER)  # 改：朋友优先
+    plural_try = _plural_fallback(wl, _ec_dict)
     if plural_try: return plural_try
     return f"保留原词：{wshow}（暂缺词典释义）"
 
@@ -804,8 +926,7 @@ def _build_dataframe(tokens):
     for idx, w in enumerate(tokens):
         if w not in first_pos: first_pos[w] = idx
     df = pd.DataFrame({"word": list(ctr.keys()), "count": [ctr[w] for w in ctr.keys()], "pos": [first_pos[w] for w in ctr.keys()]})
-    # 改：朋友优先
-    df["zh"] = df["word"].str.lower().map(_lookup_zh_base).fillna("")
+    df["zh"] = df["word"].str.lower().map(_ec_dict).fillna("")
     is_roman = df["word"].map(lambda w: w in ROMAN_MAP)
     df.loc[is_roman, "zh"] = df.loc[is_roman, "word"].map(lambda w: f"罗马数字{ROMAN_MAP[w]}")
     df["zh"] = df.apply(lambda r: MANUAL_CONTRACTIONS.get(r["word"], r["zh"]), axis=1).astype(str)
@@ -821,20 +942,18 @@ def _build_dataframe(tokens):
             parts = [p for p in word.split("-") if len(p) > 1]
             seg_zh = []
             for p in parts:
-                z = _lookup_zh_base(p.lower())  # 改：朋友优先
-                if not z and p.lower().endswith("ies") and len(p) > 3:
-                    z = _lookup_zh_base(p[:-3].lower() + "y")
-                if not z and p.lower().endswith("es") and len(p) > 2:
-                    z = _lookup_zh_base(p[:-2].lower())
-                if not z and p.lower().endswith("s") and len(p) > 1:
-                    z = _lookup_zh_base(p[:-1].lower())
+                z = _ec_dict.get(p.lower(), "")
+                if not z and p.lower().endswith("s"):
+                    if p.lower().endswith("ies") and len(p) > 3: z = _ec_dict.get(p[:-3].lower() + "y", "")
+                    if not z and p.lower().endswith("es") and len(p) > 2: z = _ec_dict.get(p[:-2].lower(), "")
+                    if not z and p.lower().endswith("s") and len(p) > 1: z = _ec_dict.get(p[:-1].lower(), "")
                 if z: seg_zh.append(_format_zh(z))
             if seg_zh: return "-".join(seg_zh)
             return ""
         return cur
     df["zh"] = df.apply(lambda r: _hyphen_zh(r["word"], r["zh"]), axis=1)
     need_plural = df["zh"].eq("") & df["word"].str.endswith("s")
-    df.loc[need_plural, "zh"] = df.loc[need_plural, "word"].map(lambda w: _plural_fallback(w, _LOOKUP_ADAPTER))
+    df.loc[need_plural, "zh"] = df.loc[need_plural, "word"].map(lambda w: _plural_fallback(w, _ec_dict))
     df["zh"] = df["zh"].map(_format_zh)
     df["zh"] = df.apply(lambda r: _fallback_guess(r["word"], r["zh"]), axis=1)
     df["word"] = df["word"].map(_display_casing)
@@ -846,6 +965,10 @@ def _build_dataframe(tokens):
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+@app.get("/upload")
+def upload_get_redirect():
+    return RedirectResponse("/", status_code=303)
+
 @app.head("/")
 def root_head():
     return PlainTextResponse("", status_code=200)
@@ -855,21 +978,22 @@ async def upload(request: Request, file: UploadFile = File(...)):
     try:
         t0 = time.perf_counter()
         data = await file.read()
-        _ = time.perf_counter()
+        t1 = time.perf_counter()
         text = _read_text_from_upload(file.filename, data)
         _detect_proper_nouns_from_text(text)
-        _ = time.perf_counter()
+        t2 = time.perf_counter()
         tokens = _tokenize(text)
-        _ = time.perf_counter()
+        t3 = time.perf_counter()
         if not tokens:
             raise ValueError("未解析到有效英文单词")
         df_freq, df_pos = _build_dataframe(tokens)
-        _ = time.perf_counter()
+        t4 = time.perf_counter()
         sid = _get_sid_from_request(request) or _ensure_session()
         _put_session(sid, file.filename, df_freq, df_pos, page_size=STATE.get("page_size", 500))
         STATE["filename"] = file.filename; STATE["df_freq"] = df_freq; STATE["df_pos"] = df_pos
         resp = RedirectResponse(url="/result?sort=freq&page=1", status_code=303)
         resp.set_cookie("sid", sid, httponly=True, samesite="lax")
+        print(f"[TIMING] read={t1-t0:.2f}s extract={t2-t1:.2f}s tokenize={t3-t2:.2f}s df={t4-t3:.2f}s")
         return resp
     except Exception as e:
         print(f"[ERROR] {e}")
@@ -944,3 +1068,17 @@ def healthz():
 @app.head("/healthz")
 def healthz_head():
     return PlainTextResponse("", status_code=200)
+
+# --- minimal hotfix: add safe GET routes for page render (no UI change) ---
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
+def index_page(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/upload", response_class=HTMLResponse)
+def upload_get(request: Request):
+    # Keep POST /upload for file submit; GET renders the same page to avoid 405 white-screen
+    return templates.TemplateResponse("index.html", {"request": request})
+# --- end hotfix ---
