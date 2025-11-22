@@ -3,6 +3,7 @@ from fastapi import FastAPI, Request, UploadFile, File, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi import BackgroundTasks  # 新增：后台任务支持
 
 import io
 import os
@@ -185,7 +186,7 @@ class FriendCsvDict:
         self.word_col_candidates = tuple(c.lower() for c in word_col_candidates)
         self.zh_col_candidates = tuple(c.lower() for c in zh_col_candidates)
         self._map = {}
-        self._ready = False
+               self._ready = False
         self._lock = threading.RLock()
         self._overrides = {}
         self.cache_size = max(1024, int(cache_size))
@@ -825,7 +826,7 @@ MANUAL_CONTRACTIONS = {
     "doesn't": "aux. 表示否定（= does not）", "doesn’t": "aux. 表示否定（= does not）",
     "i'm": "abbr. 我是（= I am）", "i’m": "abbr. 我是（= I am）",
     "i've": "contr. 我已/我有（= I have）", "i’ve": "contr. 我已/我有（= I have）",
-    "i'd": "contr. 我愿意/我已经/我应该（= I would / I had / I should）", "i’d": "contr. 我愿意/我已经/我应该（= I would / I had / I should）",
+    "i'd": "contr. 我愿意/我已经/我应该（= I would / I had / I should）", "i’d": "contr. 我愿意/我已经/我应该（= I would / I should）",
     "i'll": "contr. 我将/我会（= I will / I shall）", "i’ll": "contr. 我将/我会（= I will / I shall）",
     "you're": "contr. 你是（= you are）", "you’re": "contr. 你是（= you are）",
     "you've": "contr. 你已/你有（= you have）", "you’ve": "contr. 你已/你有（= you have）",
@@ -837,7 +838,7 @@ MANUAL_CONTRACTIONS = {
     "they've": "contr. 他们已/他们有（= they have）", "they’ve": "contr. 他们已/他们有（= they have）",
     "they'll": "contr. 他们将/他们会（= they will / they shall）", "they’ll": "contr. 他们将/他们会（= they will / they shall）",
     "he's": "contr. 他是/他有（= he is / he has）", "he’s": "contr. 他是/他有（= he is / he has）",
-    "he'd": "contr. 他愿意/他已经/他应该（= he would / he had / he should）", "he’d": "contr. 他愿意/他已经/他应该（= he would / he had / he should）",
+    "he'd": "contr. 他愿意/他已经/他应该（= he would / he had / he should）", "he’d": "contr. 他愿意/他已经/他应该（= he would / he should）",
     "he'll": "contr. 他将/他会（= he will / he shall）", "he’ll": "contr. 他将/他会（= he will / he shall）",
     "she's": "contr. 她是/她有（= she is / she has）", "she’s": "contr. 她是/她有（= she is / she has）",
     "she'd": "contr. 她愿意/她已经/她应该（= she would / she had / she should）", "she’d": "contr. 她愿意/她已经/她应该（= she would / she should）",
@@ -961,7 +962,27 @@ def _build_dataframe(tokens):
     df_pos  = df.sort_values(["pos"]).reset_index(drop=True)
     return df_freq, df_pos
 
-# A) 首页加 no-store 防缓存（关键改动）
+# ========== 新增：后台处理函数，避免上传请求超时 ==========
+def _process_upload_background(sid: str, filename: str, data: bytes):
+    try:
+        text = _read_text_from_upload(filename, data)
+        _detect_proper_nouns_from_text(text)
+        tokens = _tokenize(text)
+        if not tokens:
+            raise ValueError("未解析到有效英文单词")
+        df_freq, df_pos = _build_dataframe(tokens)
+        _put_session(sid, filename, df_freq, df_pos, page_size=STATE.get("page_size", 500))
+        STATE["filename"] = filename
+        STATE["df_freq"] = df_freq
+        STATE["df_pos"] = df_pos
+    except Exception as e:
+        # 失败也占位，页面至少有提示
+        err = pd.DataFrame([{"word":"ERROR","count":0,"pos":0,"zh":str(e)}])
+        df_freq = err.rename(columns={"count":"出现次数","word":"单词","zh":"翻译"})
+        df_pos = df_freq.copy()
+        _put_session(sid, filename, df_freq, df_pos, page_size=STATE.get("page_size", 500))
+
+# A) 首页加 no-store 防缓存（保留）
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     resp = templates.TemplateResponse("index.html", {"request": request})
@@ -980,27 +1001,16 @@ def root_head():
 def upload_head():
     return PlainTextResponse("", status_code=200)
 
+# ========== 替换：上传改为后端异步处理，立即跳转 ==========
 @app.post("/upload")
-async def upload(request: Request, file: UploadFile = File(...)):
+async def upload(request: Request, background: BackgroundTasks, file: UploadFile = File(...)):
     try:
-        t0 = time.perf_counter()
         data = await file.read()
-        t1 = time.perf_counter()
-        text = _read_text_from_upload(file.filename, data)
-        _detect_proper_nouns_from_text(text)
-        t2 = time.perf_counter()
-        tokens = _tokenize(text)
-        t3 = time.perf_counter()
-        if not tokens:
-            raise ValueError("未解析到有效英文单词")
-        df_freq, df_pos = _build_dataframe(tokens)
-        t4 = time.perf_counter()
         sid = _get_sid_from_request(request) or _ensure_session()
-        _put_session(sid, file.filename, df_freq, df_pos, page_size=STATE.get("page_size", 500))
-        STATE["filename"] = file.filename; STATE["df_freq"] = df_freq; STATE["df_pos"] = df_pos
+        _put_session(sid, file.filename, None, None, page_size=STATE.get("page_size", 500))  # 先占位
         resp = RedirectResponse(url="/result?sort=freq&page=1", status_code=303)
         resp.set_cookie("sid", sid, httponly=True, samesite="lax")
-        print(f"[TIMING] read={t1-t0:.2f}s extract={t2-t1:.2f}s tokenize={t3-t2:.2f}s df={t4-t3:.2f}s")
+        background.add_task(_process_upload_background, sid, file.filename, data)
         return resp
     except Exception as e:
         print(f"[ERROR] {e}")
@@ -1017,6 +1027,7 @@ def _slice_page(df: pd.DataFrame, page: int, page_size: int):
     sub = sub[["序号", "出现次数", "单词", "翻译"]]
     return sub, page, pages, total
 
+# ========== 替换：数据未就绪展示“处理中+自动刷新”，不再重定向回首页 ==========
 @app.get("/result", response_class=HTMLResponse)
 def result(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$"), page: int = 1):
     sess = _get_session_state(request)
@@ -1024,13 +1035,31 @@ def result(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$"), 
     df_pos  = sess["df_pos"] if sess else STATE["df_pos"]
     filename = sess["filename"] if sess else STATE["filename"]
     page_size = (sess or STATE).get("page_size", 500)
+
     if df_freq is None:
-        return RedirectResponse("/", status_code=303)
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'>"
+            "<title>Processing…</title>"
+            "<div style='font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto;'>"
+            "正在处理文件，请稍等…（页面将自动刷新）</div>"
+            "<script>setTimeout(function(){location.reload()},1500)</script>"
+        )
+
     df = df_freq if sort == "freq" else df_pos
     sub, cur, pages, total = _slice_page(df, page, page_size)
-    return templates.TemplateResponse("result.html", {"request": request, "filename": filename,
-        "rows": sub.to_dict(orient="records"), "page": cur, "pages": pages, "total": total,
-        "page_size": page_size, "sort": sort})
+    return templates.TemplateResponse(
+        "result.html",
+        {
+            "request": request,
+            "filename": filename,
+            "rows": sub.to_dict(orient="records"),
+            "page": cur,
+            "pages": pages,
+            "total": total,
+            "page_size": page_size,
+            "sort": sort,
+        }
+    )
 
 @app.get("/export")
 def export(request: Request, sort: str = Query("freq", pattern="^(freq|pos)$")):
@@ -1076,7 +1105,7 @@ def healthz():
 def healthz_head():
     return PlainTextResponse("", status_code=200)
 
-# B) 避免浏览器反复请求 favicon 404（小清理）
+# B) 避免浏览器反复请求 favicon 404（保留）
 @app.get("/favicon.ico")
 def favicon():
     return PlainTextResponse("", status_code=204)
